@@ -1,0 +1,314 @@
+import { memberIdsFrom, roomAccessFrom } from "@/domain/membership";
+import { directThreadId } from "@/features/direct/direct";
+import type { PresencePeer, RoomMessage, SharedFileRef, WorkspaceFile } from "@/domain/types";
+import { currentClientId } from "@/session/currentIdentity";
+import type { TransportEnvelope, TransportSnapshots } from "@/transport/types";
+
+interface MessagePayload {
+  roomId?: string;
+  message?: RoomMessage;
+}
+
+interface FileCreatePayload {
+  folderId?: string;
+  file?: WorkspaceFile;
+}
+
+interface FileUpdatePayload {
+  folderId?: string;
+  fileId?: string;
+  body?: string;
+}
+
+interface PresencePayload {
+  peers?: Array<Partial<PresencePeer>>;
+}
+
+function sharedFileFrom(value: unknown): SharedFileRef | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const file = value as Partial<SharedFileRef>;
+  if (typeof file.fileId !== "string" || !file.fileId || typeof file.name !== "string" || !file.name) {
+    return undefined;
+  }
+  const shared: SharedFileRef = {
+    fileId: file.fileId,
+    name: file.name,
+    folderId: typeof file.folderId === "string" ? file.folderId : "",
+  };
+  if (typeof file.mimeType === "string" && file.mimeType) {
+    shared.mimeType = file.mimeType;
+  }
+  if (typeof file.size === "number" && file.size >= 0) {
+    shared.size = file.size;
+  }
+  return shared;
+}
+
+function storedMessages(value: unknown): RoomMessage[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const messages: RoomMessage[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Partial<RoomMessage>;
+    if (typeof record.id !== "string" || !record.id || messages.some((message) => message.id === record.id)) {
+      continue;
+    }
+    const message: RoomMessage = {
+      id: record.id,
+      author: typeof record.author === "string" ? record.author : "",
+      authorId: typeof record.authorId === "string" ? record.authorId : undefined,
+      time: typeof record.time === "string" ? record.time : "",
+      sentAt: typeof record.sentAt === "string" ? record.sentAt : undefined,
+      body: typeof record.body === "string" ? record.body : "",
+      file: sharedFileFrom(record.file),
+    };
+    if (record.format === "markdown") {
+      message.format = "markdown";
+    }
+    messages.push(message);
+  }
+  return messages;
+}
+
+export function applyEnvelope(snapshots: TransportSnapshots, envelope: TransportEnvelope) {
+  if (envelope.topic === "presence") {
+    const payload = envelope.payload as PresencePayload;
+    const seen = new Set<string>();
+    const peers: PresencePeer[] = [];
+    for (const peer of payload.peers ?? []) {
+      if (!peer.clientId || seen.has(peer.clientId)) {
+        continue;
+      }
+      seen.add(peer.clientId);
+      peers.push({
+        clientId: peer.clientId,
+        displayName: peer.displayName?.trim() || "",
+        status: peer.status === "online" ? "online" : "offline",
+        connectedAt: peer.connectedAt || "",
+      });
+    }
+    snapshots.presence = { peers };
+    return;
+  }
+
+  if (envelope.topic === "rooms" && envelope.type === "message") {
+    const payload = envelope.payload as MessagePayload;
+    const room = snapshots.rooms.rooms.find((item) => item.id === payload.roomId);
+    if (!room || !payload.message || room.messages.some((item) => item.id === payload.message?.id)) {
+      return;
+    }
+    const { mine: _mine, ...message } = payload.message;
+    room.messages.push(message);
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "create") {
+    const payload = envelope.payload as FileCreatePayload;
+    const folder = snapshots.files.folders.find((item) => item.id === payload.folderId);
+    const fileId = payload.file?.id;
+    const alreadyStored = snapshots.files.folders.some((item) => item.files.some((file) => file.id === fileId));
+    if (!folder || !payload.file || !fileId || alreadyStored) {
+      return;
+    }
+    folder.files.push({ ...payload.file });
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "update") {
+    const payload = envelope.payload as FileUpdatePayload;
+    const folder = snapshots.files.folders.find((item) => item.id === payload.folderId);
+    const file = folder?.files.find((item) => item.id === payload.fileId);
+    if (file && typeof payload.body === "string" && file.editable) {
+      file.body = payload.body;
+      file.detail = "Editing";
+    }
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "folder-create") {
+    const folder = (envelope.payload as { folder?: { id?: string; name?: string } }).folder;
+    const name = folder?.name?.trim();
+    if (!folder?.id || !name || snapshots.files.folders.some((item) => item.id === folder.id)) {
+      return;
+    }
+    snapshots.files.folders.push({ id: folder.id, name, files: [] });
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "folder-rename") {
+    const payload = envelope.payload as { folderId?: string; name?: string };
+    const folder = snapshots.files.folders.find((item) => item.id === payload.folderId);
+    const name = payload.name?.trim();
+    if (folder && name) {
+      folder.name = name;
+    }
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "folder-delete") {
+    const folderId = (envelope.payload as { folderId?: string }).folderId;
+    if (!folderId) {
+      return;
+    }
+    snapshots.files.folders = snapshots.files.folders.filter((item) => item.id !== folderId);
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "file-rename") {
+    const payload = envelope.payload as { fileId?: string; name?: string };
+    const name = payload.name?.trim();
+    if (!payload.fileId || !name) {
+      return;
+    }
+    for (const folder of snapshots.files.folders) {
+      const file = folder.files.find((item) => item.id === payload.fileId);
+      if (file) {
+        file.name = name;
+        return;
+      }
+    }
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "file-delete") {
+    const fileId = (envelope.payload as { fileId?: string }).fileId;
+    if (!fileId) {
+      return;
+    }
+    for (const folder of snapshots.files.folders) {
+      folder.files = folder.files.filter((file) => file.id !== fileId);
+    }
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "file-organize") {
+    const payload = envelope.payload as { folderId?: string; file?: WorkspaceFile };
+    const folder = snapshots.files.folders.find((item) => item.id === payload.folderId);
+    const file = payload.file;
+    if (!folder || !file?.id) {
+      return;
+    }
+    for (const item of snapshots.files.folders) {
+      if (item.id === folder.id) {
+        continue;
+      }
+      item.files = item.files.filter((existing) => existing.id !== file.id);
+    }
+    if (!folder.files.some((existing) => existing.id === file.id)) {
+      folder.files.push({ ...file });
+    }
+    return;
+  }
+
+  if (envelope.topic === "files" && envelope.type === "file-move") {
+    const payload = envelope.payload as { fileId?: string; toFolderId?: string };
+    const target = snapshots.files.folders.find((item) => item.id === payload.toFolderId);
+    if (!payload.fileId || !target) {
+      return;
+    }
+    let moving: WorkspaceFile | undefined;
+    for (const folder of snapshots.files.folders) {
+      const index = folder.files.findIndex((file) => file.id === payload.fileId);
+      if (index < 0) {
+        continue;
+      }
+      if (folder.id === target.id) {
+        return;
+      }
+      moving = folder.files[index];
+      folder.files.splice(index, 1);
+      break;
+    }
+    if (moving && !target.files.some((file) => file.id === moving?.id)) {
+      target.files.push(moving);
+    }
+    return;
+  }
+
+  if (envelope.topic === "rooms" && envelope.type === "create") {
+    const room = (
+      envelope.payload as {
+        room?: { id?: string; name?: string; access?: unknown; memberIds?: unknown; messages?: unknown };
+      }
+    ).room;
+    const name = room?.name?.trim();
+    if (!room?.id || !name || snapshots.rooms.rooms.some((item) => item.id === room.id)) {
+      return;
+    }
+    const access = roomAccessFrom(room.access);
+    const memberIds = access === "selected" ? memberIdsFrom(room.memberIds) : [];
+    if (access === "selected" && !memberIds.includes(currentClientId())) {
+      return;
+    }
+    snapshots.rooms.rooms.push({
+      id: room.id,
+      name,
+      access,
+      memberIds,
+      messages: storedMessages(room.messages),
+    });
+    return;
+  }
+
+  if (envelope.topic === "rooms" && envelope.type === "rename") {
+    const payload = envelope.payload as { roomId?: string; name?: string };
+    const room = snapshots.rooms.rooms.find((item) => item.id === payload.roomId);
+    const name = payload.name?.trim();
+    if (room && name) {
+      room.name = name;
+    }
+    return;
+  }
+
+  if (envelope.topic === "rooms" && envelope.type === "members") {
+    const payload = envelope.payload as { roomId?: string; memberIds?: unknown };
+    const room = snapshots.rooms.rooms.find((item) => item.id === payload.roomId);
+    if (!room) {
+      return;
+    }
+    room.access = "selected";
+    room.memberIds = memberIdsFrom(payload.memberIds);
+    if (!room.memberIds.includes(currentClientId())) {
+      snapshots.rooms.rooms = snapshots.rooms.rooms.filter((item) => item.id !== room.id);
+    }
+    return;
+  }
+
+  if (envelope.topic === "rooms" && envelope.type === "delete") {
+    const roomId = (envelope.payload as { roomId?: string }).roomId;
+    if (!roomId) {
+      return;
+    }
+    snapshots.rooms.rooms = snapshots.rooms.rooms.filter((item) => item.id !== roomId);
+    return;
+  }
+
+  if (envelope.topic === "direct" && envelope.type === "message") {
+    const payload = envelope.payload as { participantIds?: unknown; message?: RoomMessage };
+    const participantIds = memberIdsFrom(payload.participantIds).sort();
+    const me = currentClientId();
+    if (participantIds.length !== 2 || !participantIds.includes(me) || !payload.message?.id) {
+      return;
+    }
+    const threadId = directThreadId(participantIds[0], participantIds[1]);
+    let thread = snapshots.direct.threads.find((item) => item.id === threadId);
+    if (!thread) {
+      thread = { id: threadId, participantIds, messages: [] };
+      snapshots.direct.threads.push(thread);
+    }
+    if (thread.messages.some((item) => item.id === payload.message?.id)) {
+      return;
+    }
+    const [message] = storedMessages([payload.message]);
+    if (!message) {
+      return;
+    }
+    thread.messages.push(message);
+  }
+}
