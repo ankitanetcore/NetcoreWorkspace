@@ -1,13 +1,13 @@
+import { useEffect } from "react";
 import { useLocalSearchParams } from "expo-router";
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
-import { BackButton } from "@/components/BackButton";
 import { GeometricIcon } from "@/components/GeometricIcon";
 import { canAccessRoom } from "@/domain/membership";
 import type { RoomId } from "@/domain/types";
+import { useCallControls, useCallSession } from "@/features/call/CallSession";
 import { MediaView } from "@/features/call/MediaView";
-import { startRoomCall } from "@/features/call/startCall";
-import { useRoomCall } from "@/features/call/useRoomCall";
+import { initialsFor, tilesForCall } from "@/features/call/tiles";
 import { roomIcon } from "@/features/rooms/roomIcons";
 import { useSession } from "@/session/Session";
 import { webPointer } from "@/theme/pressable";
@@ -22,8 +22,17 @@ function readRoom(value: string | string[] | undefined): RoomId | null {
 
 export function CallScreen() {
   const { clientId } = useSession();
+  const { roomId: activeRoomId, holdRoomId, startCall } = useCallSession();
   const params = useLocalSearchParams<{ room?: string | string[] }>();
-  const roomId = readRoom(params.room);
+  const requested = readRoom(params.room);
+  const roomId = requested ?? activeRoomId;
+
+  useEffect(() => {
+    if (!requested || requested === activeRoomId || requested === holdRoomId) {
+      return;
+    }
+    startCall(requested);
+  }, [requested, activeRoomId, holdRoomId, startCall]);
   const room = getTransport()
     .snapshot("rooms")
     .rooms.find((item) => item.id === roomId && canAccessRoom(item, clientId));
@@ -36,7 +45,8 @@ export function CallScreen() {
 }
 
 function RoomPicker() {
-  const { name, clientId } = useSession();
+  const { startCall } = useCallSession();
+  const { clientId } = useSession();
   const rooms = getTransport()
     .snapshot("rooms")
     .rooms.filter((room) => canAccessRoom(room, clientId));
@@ -55,7 +65,7 @@ function RoomPicker() {
             key={room.id}
             accessibilityRole="button"
             accessibilityLabel={`Start call in ${room.name}`}
-            onPress={() => startRoomCall(room.id, name, clientId)}
+            onPress={() => startCall(room.id)}
             style={({ pressed }) => [styles.roomRow, webPointer, pressed && styles.pressed]}
           >
             <View style={styles.glyph}>
@@ -85,30 +95,39 @@ function columnsFor(count: number) {
   return 4;
 }
 
-function RoomCall({ roomId, roomName }: { roomId: RoomId; roomName: string }) {
+function RoomCall({ roomName }: { roomId: RoomId; roomName: string }) {
   const { name } = useSession();
-  const call = useRoomCall(roomId);
-  const tiles = [
-    ...call.participants.map((person) => ({ ...person, self: false })),
-    {
-      id: "self",
-      name: name || "You",
-      muted: call.muted,
-      cameraOff: call.cameraOff,
-      stream: call.localStream,
-      self: true,
-    },
-  ];
+  const { minimize } = useCallSession();
+  const call = useCallControls();
+  if (!call || call === null) {
+    return (
+      <View style={styles.screen}>
+        <Text style={text.meta}>Connecting…</Text>
+      </View>
+    );
+  }
+  const tiles = tilesForCall(name, call);
   const columns = columnsFor(tiles.length);
 
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <BackButton onPress={call.leave} />
-        <Text accessibilityRole="header" style={text.title}>
-          {roomName}
-        </Text>
-        <Text style={text.meta}>{tiles.length === 1 ? "Waiting for others to join" : `${tiles.length} in this call`}</Text>
+        <View style={styles.headerRow}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Minimize call"
+            onPress={minimize}
+            style={({ pressed }) => [styles.minimize, webPointer, pressed && styles.pressed]}
+          >
+            <MinimizeIcon color={colors.ink} />
+          </Pressable>
+          <View style={styles.headerCopy}>
+            <Text accessibilityRole="header" style={text.title}>
+              {roomName}
+            </Text>
+            <Text style={text.meta}>{tiles.length === 1 ? "Waiting for others to join" : `${tiles.length} in this call`}</Text>
+          </View>
+        </View>
       </View>
       <View style={styles.meeting}>
         <ScrollView style={styles.stage} contentContainerStyle={styles.stageScroll}>
@@ -130,19 +149,30 @@ function RoomCall({ roomId, roomName }: { roomId: RoomId; roomName: string }) {
           </View>
         </ScrollView>
         <View style={styles.controls}>
-          <ControlButton
-            label={call.muted ? "Muted" : "Mute"}
-            selected={call.muted}
-            onPress={call.toggleMute}
-          />
-          <ControlButton
-            label={call.cameraOff ? "Camera off" : "Camera"}
-            selected={call.cameraOff}
-            onPress={call.toggleCamera}
-          />
-          {Platform.OS === "web" ? (
-            <ControlButton label="Leave" selected={false} onPress={call.leave} />
-          ) : null}
+          <View style={styles.toggles}>
+            <StateButton
+              kind="mic"
+              off={call.muted}
+              label={call.muted ? "Muted" : "Mic on"}
+              hint={call.muted ? "Microphone is muted" : "Microphone is on"}
+              onPress={call.toggleMute}
+            />
+            <StateButton
+              kind="camera"
+              off={call.cameraOff}
+              label={call.cameraOff ? "Camera off" : "Camera on"}
+              hint={call.cameraOff ? "Camera is off" : "Camera is on"}
+              onPress={call.toggleCamera}
+            />
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Leave call"
+            onPress={call.leave}
+            style={({ pressed }) => [styles.leave, webPointer, pressed && styles.pressed]}
+          >
+            <Text style={styles.leaveLabel}>Leave</Text>
+          </Pressable>
         </View>
       </View>
     </View>
@@ -154,7 +184,6 @@ function Tile({
   muted,
   cameraOff,
   stream,
-  self,
 }: {
   name: string;
   muted: boolean;
@@ -163,16 +192,10 @@ function Tile({
   self: boolean;
 }) {
   const showVideo = stream != null && !cameraOff;
-  const initials = name
-    .replace(" (you)", "")
-    .trim()
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part.slice(0, 1).toUpperCase())
-    .join("");
+  const initials = initialsFor(name);
   return (
     <View style={[styles.tile, cameraOff && styles.tileDimmed]}>
-      {showVideo ? <MediaView stream={stream} silent={self} /> : null}
+      {showVideo ? <MediaView stream={stream} silent /> : null}
       {showVideo ? null : (
         <View style={styles.avatar}>
           <Text style={styles.initials}>{initials || "?"}</Text>
@@ -189,29 +212,61 @@ function Tile({
   );
 }
 
-function ControlButton({
+function StateButton({
+  kind,
+  off,
   label,
-  selected,
+  hint,
   onPress,
 }: {
+  kind: "mic" | "camera";
+  off: boolean;
   label: string;
-  selected: boolean;
+  hint: string;
   onPress: () => void;
 }) {
+  const iconColor = off ? colors.youText : colors.online;
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityState={{ selected }}
+      accessibilityLabel={hint}
+      accessibilityState={{ selected: !off }}
       onPress={onPress}
-      style={({ pressed }) => [
-        styles.control,
-        selected && styles.controlSelected,
-        webPointer,
-        pressed && styles.pressed,
-      ]}
+      style={({ pressed }) => [styles.stateButton, off ? styles.stateOff : styles.stateLive, webPointer, pressed && styles.pressed]}
     >
-      <Text style={styles.controlLabel}>{label}</Text>
+      <View style={styles.iconSlot}>
+        {kind === "mic" ? <MicIcon color={iconColor} /> : <CameraIcon color={iconColor} />}
+        {off ? <View style={styles.slash} /> : null}
+      </View>
+      <Text style={[styles.stateLabel, off ? styles.stateLabelOff : styles.stateLabelLive]}>{label}</Text>
     </Pressable>
+  );
+}
+
+function MicIcon({ color }: { color: string }) {
+  return (
+    <View style={styles.mic}>
+      <View style={[styles.micHead, { borderColor: color }]} />
+      <View style={[styles.micCup, { borderColor: color }]} />
+      <View style={[styles.micStem, { backgroundColor: color }]} />
+    </View>
+  );
+}
+
+function CameraIcon({ color }: { color: string }) {
+  return (
+    <View style={[styles.camera, { borderColor: color }]}>
+      <View style={[styles.cameraLens, { borderColor: color }]} />
+    </View>
+  );
+}
+
+function MinimizeIcon({ color }: { color: string }) {
+  return (
+    <View style={styles.minimizeIcon}>
+      <View style={[styles.minimizeBack, { borderColor: color }]} />
+      <View style={[styles.minimizeFront, { borderColor: color }]} />
+    </View>
   );
 }
 
@@ -225,7 +280,49 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingTop: 22,
     paddingBottom: 14,
+  },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  headerCopy: {
+    flex: 1,
+    minWidth: 0,
     gap: 4,
+  },
+  minimize: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  minimizeIcon: {
+    width: 16,
+    height: 16,
+  },
+  minimizeBack: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    width: 9,
+    height: 9,
+    borderWidth: 1.75,
+    borderRadius: 1,
+  },
+  minimizeFront: {
+    position: "absolute",
+    right: 0,
+    bottom: 0,
+    width: 9,
+    height: 9,
+    borderWidth: 1.75,
+    borderRadius: 1,
+    backgroundColor: colors.surface,
   },
   picker: {
     paddingVertical: 8,
@@ -338,25 +435,111 @@ const styles = StyleSheet.create({
   },
   controls: {
     flexDirection: "row",
-    justifyContent: "center",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 12,
+  },
+  toggles: {
+    flexGrow: 1,
+    flexDirection: "row",
+    flexWrap: "wrap",
     gap: 10,
   },
-  control: {
-    minHeight: 44,
-    paddingHorizontal: 18,
-    borderRadius: 22,
-    backgroundColor: colors.navy,
+  stateButton: {
+    minHeight: 52,
+    minWidth: 124,
+    paddingHorizontal: 14,
+    borderRadius: 26,
+    borderWidth: 2,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  stateLive: {
+    backgroundColor: "#E7F6EE",
+    borderColor: colors.online,
+  },
+  stateOff: {
+    backgroundColor: colors.burgundy,
+    borderColor: colors.burgundy,
+  },
+  stateLabel: {
+    fontSize: 14,
+    lineHeight: 18,
+    fontWeight: "700",
+  },
+  stateLabelLive: {
+    color: "#1E6B40",
+  },
+  stateLabelOff: {
+    color: colors.youText,
+  },
+  iconSlot: {
+    width: 22,
+    height: 18,
     alignItems: "center",
     justifyContent: "center",
   },
-  controlSelected: {
-    backgroundColor: colors.burgundy,
+  slash: {
+    position: "absolute",
+    width: 22,
+    height: 2,
+    borderRadius: 1,
+    backgroundColor: colors.youText,
+    transform: [{ rotate: "-40deg" }],
   },
-  controlLabel: {
+  mic: {
+    width: 16,
+    height: 18,
+    alignItems: "center",
+  },
+  micHead: {
+    width: 8,
+    height: 10,
+    borderRadius: 4,
+    borderWidth: 1.75,
+  },
+  micCup: {
+    width: 12,
+    height: 6,
+    marginTop: -3,
+    borderBottomLeftRadius: 8,
+    borderBottomRightRadius: 8,
+    borderWidth: 1.75,
+    borderTopWidth: 0,
+  },
+  micStem: {
+    width: 1.75,
+    height: 3,
+  },
+  camera: {
+    width: 20,
+    height: 14,
+    borderRadius: 3,
+    borderWidth: 1.75,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cameraLens: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    borderWidth: 1.5,
+  },
+  leave: {
+    minHeight: 52,
+    paddingHorizontal: 22,
+    borderRadius: 12,
+    backgroundColor: "#8E2F2F",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  leaveLabel: {
     color: colors.youText,
-    fontSize: 14,
-    lineHeight: 18,
-    fontWeight: "600",
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: "700",
   },
   pressed: {
     opacity: 0.72,

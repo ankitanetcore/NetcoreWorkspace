@@ -5,6 +5,7 @@ import { Platform, Text, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { AppShell } from "@/components/AppShell";
+import { CallProvider } from "@/features/call/CallSession";
 import { NameGate } from "@/features/entry/NameGate";
 import { SessionProvider, useSession } from "@/session/Session";
 import { loadWorkspaceFonts } from "@/theme/loadFonts";
@@ -53,9 +54,11 @@ function Workspace() {
   }
 
   return (
-    <AppShell>
-      <Slot />
-    </AppShell>
+    <CallProvider>
+      <AppShell>
+        <Slot />
+      </AppShell>
+    </CallProvider>
   );
 }
 

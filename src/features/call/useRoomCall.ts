@@ -1,11 +1,16 @@
-import { router } from "expo-router";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import type { RoomCallControls } from "@/features/call/roomCallTypes";
 
-export function useRoomCall(_roomId: string): RoomCallControls {
+export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCallControls | null {
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
+  const onEndedRef = useRef(onEnded);
+  onEndedRef.current = onEnded;
+
+  if (!roomId) {
+    return null;
+  }
 
   return {
     muted,
@@ -19,7 +24,7 @@ export function useRoomCall(_roomId: string): RoomCallControls {
       setCameraOff((value) => !value);
     },
     leave() {
-      router.back();
+      onEndedRef.current?.();
     },
   };
 }

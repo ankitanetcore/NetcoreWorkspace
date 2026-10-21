@@ -15,7 +15,7 @@ import { BackButton } from "@/components/BackButton";
 import { GeometricIcon } from "@/components/GeometricIcon";
 import { canAccessRoom, normalizeRoom } from "@/domain/membership";
 import type { PresencePeer, Room, RoomMessage, RoomsSnapshot } from "@/domain/types";
-import { joinRoomCall, startRoomCall } from "@/features/call/startCall";
+import { useCallSession } from "@/features/call/CallSession";
 import { DirectPane, Composer, type OutgoingMessage } from "@/features/direct/DirectPane";
 import { assetFromFile } from "@/features/files/desktopFile";
 import { FileDropSurface } from "@/features/files/FileDropSurface";
@@ -363,6 +363,7 @@ function Thread({
   onBack?: () => void;
 }) {
   const { name, clientId } = useSession();
+  const { startCall, requestJoin } = useCallSession();
   const peers = useKnownPeers();
   const call = useActiveRoomCall(room.id);
   const incoming = call && !call.participantIds.includes(clientId) ? call : null;
@@ -435,7 +436,7 @@ function Thread({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Start call in ${room.name}`}
-              onPress={() => startRoomCall(room.id, name, clientId)}
+              onPress={() => startCall(room.id)}
               style={({ pressed }) => [styles.callButton, webPointer, pressed && styles.pressed]}
             >
               <GeometricIcon name="call" size={16} color={colors.youText} />
@@ -453,7 +454,14 @@ function Thread({
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Join"
-            onPress={() => joinRoomCall(room.id)}
+            onPress={() =>
+              requestJoin({
+                roomId: room.id,
+                roomName: room.name,
+                startedBy: incoming.startedBy,
+                startedName: displayNameFor(peers, incoming.startedBy, incoming.startedName, { clientId, name }),
+              })
+            }
             style={({ pressed }) => [styles.joinButton, webPointer, pressed && styles.pressed]}
           >
             <Text style={styles.callLabel}>Join</Text>

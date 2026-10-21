@@ -1,4 +1,3 @@
-import { router } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 
 import type { CallParticipant, RoomCallControls } from "@/features/call/roomCallTypes";
@@ -62,11 +61,12 @@ function logPeer(pc: RTCPeerConnection, label: string) {
   });
 }
 
-export function useRoomCall(roomId: string): RoomCallControls {
+export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCallControls | null {
   const { name, clientId } = useSession();
   const clientIdRef = useRef(clientId);
-  const roomRef = useRef(roomId);
+  const roomRef = useRef(roomId ?? "");
   const nameRef = useRef(name);
+  const onEndedRef = useRef(onEnded);
   const linksRef = useRef(new Map<string, RemoteLink>());
   const announcedRef = useRef(new Set<string>());
   const localRef = useRef<MediaStream | null>(null);
@@ -79,9 +79,12 @@ export function useRoomCall(roomId: string): RoomCallControls {
   const mutedRef = useRef(false);
   const cameraRef = useRef(false);
 
-  roomRef.current = roomId;
+  if (roomId) {
+    roomRef.current = roomId;
+  }
   nameRef.current = name;
   clientIdRef.current = clientId;
+  onEndedRef.current = onEnded;
 
   function publishRoster() {
     setParticipants(
@@ -317,26 +320,34 @@ export function useRoomCall(roomId: string): RoomCallControls {
   }
 
   useEffect(() => {
+    if (!roomId) {
+      return;
+    }
     let stopped = false;
+    const joinedRoom = roomId;
     const selfId = clientIdRef.current;
     leftRef.current = false;
+    mutedRef.current = false;
+    cameraRef.current = false;
+    setMuted(false);
+    setCameraOff(false);
 
-    function hangUp(navigate: boolean) {
+    function hangUp(notify: boolean) {
       if (leftRef.current) {
-        if (navigate) {
-          router.back();
+        if (notify) {
+          onEndedRef.current?.();
         }
         return;
       }
       leftRef.current = true;
-      publish("leave", { roomId: roomRef.current, clientId: selfId });
+      publish("leave", { roomId: joinedRoom, clientId: selfId });
       closeAll();
       localRef.current?.getTracks().forEach((track) => track.stop());
       localRef.current = null;
       localPromiseRef.current = null;
       setLocalStream(null);
-      if (navigate) {
-        router.back();
+      if (notify) {
+        onEndedRef.current?.();
       }
     }
 
@@ -430,7 +441,7 @@ export function useRoomCall(roomId: string): RoomCallControls {
         return;
       }
       publish("join", {
-        roomId,
+        roomId: joinedRoom,
         clientId: selfId,
         name: nameRef.current,
         muted: mutedRef.current,
@@ -485,8 +496,8 @@ export function useRoomCall(roomId: string): RoomCallControls {
   }
 
   function leave() {
-    if (leftRef.current) {
-      router.back();
+    if (!roomRef.current || leftRef.current) {
+      onEndedRef.current?.();
       return;
     }
     leftRef.current = true;
@@ -496,7 +507,11 @@ export function useRoomCall(roomId: string): RoomCallControls {
     localRef.current = null;
     localPromiseRef.current = null;
     setLocalStream(null);
-    router.back();
+    onEndedRef.current?.();
+  }
+
+  if (!roomId) {
+    return null;
   }
 
   return {
