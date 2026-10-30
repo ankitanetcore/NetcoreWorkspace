@@ -4,12 +4,17 @@ import { createClientId } from "@/session/createClientId";
 import { rememberIdentity } from "@/session/currentIdentity";
 import { loadStoredIdentity, storeIdentity } from "@/session/deviceStorage";
 import { announcePresence } from "@/session/presence";
+import { cleanProfile, type ProfileInput } from "@/session/profile";
 
 interface Session {
   clientId: string;
   name: string;
+  title: string;
+  location: string;
+  photoUri: string;
   ready: boolean;
-  enter: (name: string) => void;
+  enter: (profile: ProfileInput) => void;
+  updateProfile: (profile: ProfileInput) => void;
   rename: (name: string) => void;
 }
 
@@ -17,14 +22,21 @@ const SessionContext = createContext<Session | null>(null);
 
 function initialSession() {
   if (typeof window === "undefined") {
-    return { ready: false, clientId: "", name: "" };
+    return { ready: false, clientId: "", name: "", title: "", location: "", photoUri: "" };
   }
   const stored = loadStoredIdentity();
   if (stored) {
     rememberIdentity({ clientId: stored.clientId, displayName: stored.displayName });
-    return { ready: true, clientId: stored.clientId, name: stored.displayName };
+    return {
+      ready: true,
+      clientId: stored.clientId,
+      name: stored.displayName,
+      title: stored.title ?? "",
+      location: stored.location ?? "",
+      photoUri: stored.photoUri ?? "",
+    };
   }
-  return { ready: true, clientId: createClientId(), name: "" };
+  return { ready: true, clientId: createClientId(), name: "", title: "", location: "", photoUri: "" };
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {
@@ -36,10 +48,17 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     }
     const stored = loadStoredIdentity();
     if (stored) {
-      setSession({ ready: true, clientId: stored.clientId, name: stored.displayName });
+      setSession({
+        ready: true,
+        clientId: stored.clientId,
+        name: stored.displayName,
+        title: stored.title ?? "",
+        location: stored.location ?? "",
+        photoUri: stored.photoUri ?? "",
+      });
       return;
     }
-    setSession({ ready: true, clientId: createClientId(), name: "" });
+    setSession({ ready: true, clientId: createClientId(), name: "", title: "", location: "", photoUri: "" });
   }, [session.ready]);
 
   useEffect(() => {
@@ -49,26 +68,30 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     rememberIdentity({ clientId: session.clientId, displayName: session.name });
   }, [session]);
 
-  function enter(nextName: string) {
-    const trimmed = nextName.trim();
-    if (!trimmed || !session.clientId) {
+  function save(profile: ProfileInput) {
+    const next = cleanProfile(profile);
+    if (!next.displayName || !session.clientId) {
       return;
     }
-    storeIdentity({ clientId: session.clientId, displayName: trimmed });
-    rememberIdentity({ clientId: session.clientId, displayName: trimmed });
-    setSession({ ready: true, clientId: session.clientId, name: trimmed });
-    announcePresence(trimmed);
+    storeIdentity({ clientId: session.clientId, ...next });
+    rememberIdentity({ clientId: session.clientId, displayName: next.displayName });
+    setSession({
+      ready: true,
+      clientId: session.clientId,
+      name: next.displayName,
+      title: next.title,
+      location: next.location,
+      photoUri: next.photoUri,
+    });
+    announcePresence(next.displayName);
   }
 
   function rename(nextName: string) {
     const trimmed = nextName.trim();
-    if (!trimmed || !session.clientId || trimmed === session.name) {
+    if (!trimmed || trimmed === session.name) {
       return;
     }
-    storeIdentity({ clientId: session.clientId, displayName: trimmed });
-    rememberIdentity({ clientId: session.clientId, displayName: trimmed });
-    setSession({ ready: true, clientId: session.clientId, name: trimmed });
-    announcePresence(trimmed);
+    save({ name: trimmed, title: session.title, location: session.location, photoUri: session.photoUri });
   }
 
   return (
@@ -76,8 +99,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       value={{
         clientId: session.clientId,
         name: session.name,
+        title: session.title,
+        location: session.location,
+        photoUri: session.photoUri,
         ready: session.ready,
-        enter,
+        enter: save,
+        updateProfile: save,
         rename,
       }}
     >

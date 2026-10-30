@@ -2,6 +2,7 @@ import { useRouter } from "expo-router";
 import { useState } from "react";
 import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
+import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { SearchIcon } from "@/components/SearchIcon";
 import type { PresencePeer } from "@/domain/types";
 import { selectDirect } from "@/features/messages/selection";
@@ -152,14 +153,6 @@ function emptyLabel(total: number, needle: string, filter: PresenceFilter) {
   return "No members match.";
 }
 
-function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return "?";
-  }
-  return parts[0].slice(0, 1).toUpperCase();
-}
-
 function PersonRow({
   peer,
   you,
@@ -172,13 +165,18 @@ function PersonRow({
   onMessage?: () => void;
 }) {
   const online = peer.status === "online";
+  const detail = [peer.title, peer.location].filter(Boolean).join(" · ");
 
   return (
     <View style={[styles.row, !last && styles.rowBorder]}>
       <View style={styles.avatarWrap}>
-        <View style={styles.avatar}>
-          <Text style={styles.avatarLabel}>{initials(peer.displayName)}</Text>
-        </View>
+        <ProfileAvatar
+          name={peer.displayName}
+          photoUri={peer.photoUri}
+          size={40}
+          backgroundColor={colors.burgundySoft}
+          color={colors.burgundy}
+        />
         <View style={[styles.statusDot, online ? styles.statusOnline : styles.statusOffline]} />
       </View>
       <View style={styles.copy}>
@@ -186,7 +184,9 @@ function PersonRow({
           {peer.displayName}
           {you ? " (you)" : ""}
         </Text>
-        <Text style={styles.status}>{online ? "Online" : "Offline"}</Text>
+        <Text style={styles.status} numberOfLines={1}>
+          {detail || (online ? "Online" : "Offline")}
+        </Text>
       </View>
       {onMessage ? (
         <Pressable
@@ -339,20 +339,6 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     flexShrink: 0,
-  },
-  avatar: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: colors.burgundySoft,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  avatarLabel: {
-    color: colors.burgundy,
-    fontSize: 15,
-    lineHeight: 18,
-    fontWeight: "600",
   },
   statusDot: {
     position: "absolute",

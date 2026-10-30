@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { CallParticipant, RoomCallControls } from "@/features/call/roomCallTypes";
+import { takeStagedCamera } from "@/features/call/cameraStage";
 import { useSession } from "@/session/Session";
 import { subscribeConnection } from "@/transport/connectionPhase";
 import { getTransport } from "@/transport";
@@ -14,6 +15,7 @@ interface Signal {
   to?: string;
   muted?: boolean;
   cameraOff?: boolean;
+  sharing?: boolean;
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
 }
@@ -25,9 +27,13 @@ interface RemoteLink {
   cameraOff: boolean;
   pc: RTCPeerConnection | null;
   stream: MediaStream;
+  screen: MediaStream | null;
+  screenTrack: MediaStreamTrack | null;
+  sharing: boolean;
   pendingIce: RTCIceCandidateInit[];
   offered: boolean;
   answered: boolean;
+  needsRenegotiation: boolean;
 }
 
 function liveParticipantName(id: string | undefined, fallback?: string) {
@@ -71,10 +77,13 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
   const announcedRef = useRef(new Set<string>());
   const localRef = useRef<MediaStream | null>(null);
   const localPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
+  const screenRef = useRef<MediaStream | null>(null);
   const leftRef = useRef(false);
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [participants, setParticipants] = useState<CallParticipant[]>([]);
   const mutedRef = useRef(false);
   const cameraRef = useRef(false);
@@ -94,6 +103,7 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
         muted: link.muted,
         cameraOff: link.cameraOff,
         stream: link.stream.getTracks().length > 0 ? new MediaStream(link.stream.getTracks()) : null,
+        screenStream: link.screen,
       })),
     );
   }
@@ -141,9 +151,13 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
       cameraOff: false,
       pc: null,
       stream: new MediaStream(),
+      screen: null,
+      screenTrack: null,
+      sharing: false,
       pendingIce: [],
       offered: false,
       answered: false,
+      needsRenegotiation: false,
     };
     linksRef.current.set(remoteId, link);
     return link;
@@ -183,6 +197,24 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
         readyState: event.track.readyState,
         streams: event.streams.length,
       });
+      const known = link.stream.getTracks().some((item) => item.id === event.track.id) || link.screenTrack?.id === event.track.id;
+      if (known) {
+        return;
+      }
+      if (event.track.kind === "video" && link.sharing && link.stream.getVideoTracks().length > 0 && !link.screenTrack) {
+        link.screenTrack = event.track;
+        link.screen = new MediaStream([event.track]);
+        event.track.onended = () => {
+          if (link.screenTrack?.id === event.track.id) {
+            link.screenTrack = null;
+            link.screen = null;
+            link.sharing = false;
+            publishRoster();
+          }
+        };
+        publishRoster();
+        return;
+      }
       if (!link.stream.getTracks().some((item) => item.id === event.track.id)) {
         link.stream.addTrack(event.track);
       }
@@ -199,10 +231,20 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
         candidate: event.candidate.toJSON(),
       });
     };
-    pc.onsignalingstatechange = () => logPeer(pc, `signalingState ${remoteId.slice(0, 8)}`);
+    pc.onsignalingstatechange = () => {
+      logPeer(pc, `signalingState ${remoteId.slice(0, 8)}`);
+      if (pc.signalingState === "stable" && link.needsRenegotiation) {
+        link.needsRenegotiation = false;
+        void renegotiate(remoteId);
+      }
+    };
     pc.oniceconnectionstatechange = () => logPeer(pc, `iceConnectionState ${remoteId.slice(0, 8)}`);
     pc.onconnectionstatechange = () => logPeer(pc, `connectionState ${remoteId.slice(0, 8)}`);
     return pc;
+  }
+
+  function outgoingVideoTrack() {
+    return localRef.current?.getVideoTracks()[0] ?? null;
   }
 
   function addLocalTracks(pc: RTCPeerConnection) {
@@ -210,11 +252,23 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     if (!local) {
       return;
     }
-    for (const track of local.getTracks()) {
+    for (const track of local.getAudioTracks()) {
       const already = pc.getSenders().some((sender) => sender.track?.id === track.id);
       if (!already) {
         pc.addTrack(track, local);
       }
+    }
+    const video = outgoingVideoTrack();
+    if (!video) {
+      return;
+    }
+    const already = pc.getSenders().some((sender) => sender.track?.id === video.id);
+    if (!already) {
+      pc.addTrack(video, local);
+    }
+    const screenTrack = screenRef.current?.getVideoTracks()[0];
+    if (screenTrack && !pc.getSenders().some((sender) => sender.track?.id === screenTrack.id)) {
+      pc.addTrack(screenTrack, screenRef.current as MediaStream);
     }
   }
 
@@ -286,9 +340,23 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     });
   }
 
-  async function acceptOffer(remoteId: string, sdp: RTCSessionDescriptionInit) {
+  async function acceptOffer(remoteId: string, sdp: RTCSessionDescriptionInit, sharing?: boolean) {
     const link = linkFor(remoteId);
-    if (leftRef.current || link.answered || isOfferer(remoteId)) {
+    if (leftRef.current) {
+      return;
+    }
+    if (typeof sharing === "boolean") {
+      link.sharing = sharing;
+      if (!sharing) {
+        link.screen = null;
+        link.screenTrack = null;
+      }
+    }
+    const renegotiation = Boolean(link.pc);
+    if (renegotiation && link.pc?.signalingState !== "stable") {
+      return;
+    }
+    if (!renegotiation && (link.answered || isOfferer(remoteId))) {
       return;
     }
     link.answered = true;
@@ -306,6 +374,7 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
       from: clientIdRef.current,
       to: remoteId,
       name: nameRef.current,
+      sharing: Boolean(screenRef.current),
       sdp: pc.localDescription?.toJSON(),
     });
     await flushIce(link);
@@ -316,6 +385,13 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     link.name = liveParticipantName(remoteId, payload.name);
     link.muted = Boolean(payload.muted);
     link.cameraOff = Boolean(payload.cameraOff);
+    if (typeof payload.sharing === "boolean") {
+      link.sharing = payload.sharing;
+      if (!payload.sharing) {
+        link.screen = null;
+        link.screenTrack = null;
+      }
+    }
     publishRoster();
   }
 
@@ -331,6 +407,11 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     cameraRef.current = false;
     setMuted(false);
     setCameraOff(false);
+    const staged = takeStagedCamera();
+    if (staged) {
+      localRef.current = staged.stream;
+      setLocalStream(staged.stream);
+    }
 
     function hangUp(notify: boolean) {
       if (leftRef.current) {
@@ -345,7 +426,11 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
       localRef.current?.getTracks().forEach((track) => track.stop());
       localRef.current = null;
       localPromiseRef.current = null;
+      screenRef.current?.getTracks().forEach((track) => track.stop());
+      screenRef.current = null;
       setLocalStream(null);
+      setScreenStream(null);
+      setSharing(false);
       if (notify) {
         onEndedRef.current?.();
       }
@@ -386,7 +471,7 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
       }
       if (envelope.type === "offer" && payload.from && payload.sdp) {
         noteRemote(payload.from, payload);
-        await acceptOffer(payload.from, payload.sdp);
+        await acceptOffer(payload.from, payload.sdp, payload.sharing);
         return;
       }
       if (envelope.type === "answer" && payload.from && payload.sdp) {
@@ -396,8 +481,15 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
         }
         if (payload.name) {
           link.name = liveParticipantName(payload.from, payload.name);
-          publishRoster();
         }
+        if (typeof payload.sharing === "boolean") {
+          link.sharing = payload.sharing;
+          if (!payload.sharing) {
+            link.screen = null;
+            link.screenTrack = null;
+          }
+        }
+        publishRoster();
         await link.pc.setRemoteDescription(payload.sdp);
         await flushIce(link);
         return;
@@ -495,6 +587,96 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     });
   }
 
+  async function renegotiate(remoteId: string) {
+    const link = linksRef.current.get(remoteId);
+    const pc = link?.pc;
+    if (!link || !pc || leftRef.current) {
+      return;
+    }
+    if (pc.signalingState !== "stable") {
+      link.needsRenegotiation = true;
+      return;
+    }
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    publish("offer", {
+      roomId: roomRef.current,
+      from: clientIdRef.current,
+      to: remoteId,
+      name: nameRef.current,
+      sharing: Boolean(screenRef.current),
+      sdp: pc.localDescription?.toJSON(),
+    });
+  }
+
+  function publishSelf() {
+    publish("state", {
+      roomId: roomRef.current,
+      clientId: clientIdRef.current,
+      name: nameRef.current,
+      muted: mutedRef.current,
+      cameraOff: cameraRef.current,
+      sharing: Boolean(screenRef.current),
+    });
+  }
+
+  async function stopScreenShare() {
+    const display = screenRef.current;
+    const track = display?.getVideoTracks()[0];
+    screenRef.current = null;
+    setScreenStream(null);
+    setSharing(false);
+    if (track) {
+      track.onended = null;
+      for (const link of linksRef.current.values()) {
+        const sender = link.pc?.getSenders().find((item) => item.track?.id === track.id);
+        if (sender && link.pc) {
+          link.pc.removeTrack(sender);
+        }
+      }
+      track.stop();
+    }
+    for (const id of linksRef.current.keys()) {
+      await renegotiate(id);
+    }
+    publishSelf();
+  }
+
+  async function toggleScreenShare() {
+    if (screenRef.current) {
+      await stopScreenShare();
+      return;
+    }
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      if (leftRef.current) {
+        display.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const track = display.getVideoTracks()[0];
+      if (!track) {
+        return;
+      }
+      track.contentHint = "detail";
+      track.onended = () => {
+        void stopScreenShare();
+      };
+      screenRef.current = display;
+      setScreenStream(display);
+      setSharing(true);
+      for (const [id, link] of linksRef.current) {
+        if (!link.pc) {
+          continue;
+        }
+        link.pc.addTrack(track, display);
+        await renegotiate(id);
+      }
+      publishSelf();
+    } catch (error) {
+      console.log("getDisplayMedia failed", error);
+    }
+  }
+
   function leave() {
     if (!roomRef.current || leftRef.current) {
       onEndedRef.current?.();
@@ -506,7 +688,11 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     localRef.current?.getTracks().forEach((track) => track.stop());
     localRef.current = null;
     localPromiseRef.current = null;
+    screenRef.current?.getTracks().forEach((track) => track.stop());
+    screenRef.current = null;
     setLocalStream(null);
+    setScreenStream(null);
+    setSharing(false);
     onEndedRef.current?.();
   }
 
@@ -517,10 +703,15 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
   return {
     muted,
     cameraOff,
+    sharing,
     localStream,
+    screenStream,
     participants,
     toggleMute,
     toggleCamera,
+    toggleScreenShare: () => {
+      void toggleScreenShare();
+    },
     leave,
   };
 }

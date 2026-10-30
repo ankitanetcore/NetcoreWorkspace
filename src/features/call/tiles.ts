@@ -6,6 +6,7 @@ export interface CallTile {
   muted: boolean;
   cameraOff: boolean;
   stream: unknown;
+  screenStream?: unknown;
   self: boolean;
 }
 
@@ -18,6 +19,7 @@ export function tilesForCall(name: string, call: RoomCallControls): CallTile[] {
       muted: call.muted,
       cameraOff: call.cameraOff,
       stream: call.localStream,
+      screenStream: null,
       self: true,
     },
   ];

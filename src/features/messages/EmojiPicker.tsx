@@ -7,10 +7,14 @@ import { colors, font } from "@/theme/tokens";
 
 export function EmojiPicker({
   anchorRef,
+  align = "start",
+  docked = false,
   onClose,
   onSelect,
 }: {
   anchorRef: { current: View | null };
+  align?: "start" | "end";
+  docked?: boolean;
   onClose: () => void;
   onSelect: (emoji: string) => void;
 }) {
@@ -57,7 +61,12 @@ export function EmojiPicker({
   }, [anchorRef, onClose]);
 
   return (
-    <View ref={rootRef} style={styles.popover} accessibilityRole="menu" accessibilityLabel="Emoji picker">
+    <View
+      ref={rootRef}
+      style={[styles.popover, docked ? styles.popoverDocked : align === "end" ? styles.popoverEnd : styles.popoverStart]}
+      accessibilityRole="menu"
+      accessibilityLabel="Emoji picker"
+    >
       <TextInput
         ref={searchRef}
         value={query}
@@ -122,11 +131,9 @@ export function EmojiPicker({
 const styles = StyleSheet.create({
   popover: {
     position: "absolute",
-    left: 0,
     bottom: "100%",
     width: 320,
     height: 350,
-    maxWidth: "100%",
     marginBottom: 8,
     zIndex: 30,
     padding: 8,
@@ -139,6 +146,22 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.12,
     shadowRadius: 18,
     elevation: 8,
+  },
+  popoverStart: {
+    left: 0,
+  },
+  popoverEnd: {
+    right: 0,
+  },
+  popoverDocked: {
+    position: "relative",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    width: "100%",
+    height: "100%",
+    marginBottom: 0,
   },
   search: {
     ...font.content,

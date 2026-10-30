@@ -30,7 +30,9 @@ function uniqueName(folderId: string, requested: string) {
 
 function publishFile(folderId: string, file: WorkspaceFile) {
   const clientId = currentClientId();
-  const stored = clientId ? { ...file, clientId } : file;
+  const now = new Date().toISOString();
+  const stamped = { ...file, uploadedAt: file.uploadedAt || now, modifiedAt: file.modifiedAt || now };
+  const stored = clientId ? { ...stamped, clientId } : stamped;
   getTransport().publish({
     id: stored.id,
     topic: "files",
@@ -53,14 +55,35 @@ function publishFiles(id: string, type: string, payload: unknown) {
   });
 }
 
-export function createFolder(rawName: string) {
+export function createFolder(rawName: string, parentId?: string | null) {
   const name = rawName.trim();
   if (!name) {
     return null;
   }
   const id = `folder-${createClientId()}`;
-  publishFiles(id, "folder-create", { folder: { id, name } });
+  const folder: { id: string; name: string; parentId?: string } = { id, name };
+  if (parentId) {
+    folder.parentId = parentId;
+  }
+  publishFiles(id, "folder-create", { folder });
   return id;
+}
+
+export function reorderFolders(parentId: string | null, folderIds: string[]) {
+  if (folderIds.length < 2 || new Set(folderIds).size !== folderIds.length) {
+    return;
+  }
+  publishFiles(`reorder-folders-${Date.now()}`, "folder-reorder", {
+    parentId: parentId ?? "",
+    folderIds,
+  });
+}
+
+export function moveFolder(folderId: string, parentId: string | null) {
+  if (!folderId) {
+    return;
+  }
+  publishFiles(`move-folder-${folderId}`, "folder-move", { folderId, parentId: parentId ?? "" });
 }
 
 export function renameFolder(folderId: string, rawName: string) {
@@ -83,7 +106,18 @@ export function renameFile(fileId: string, rawName: string) {
   if (!fileId || !name) {
     return;
   }
-  publishFiles(`rename-file-${fileId}`, "file-rename", { fileId, name });
+  publishFiles(`rename-file-${fileId}`, "file-rename", {
+    fileId,
+    name,
+    modifiedAt: new Date().toISOString(),
+  });
+}
+
+export function pinFile(fileId: string, pinned: boolean) {
+  if (!fileId) {
+    return;
+  }
+  publishFiles(`pin-file-${fileId}`, "file-pin", { fileId, pinned });
 }
 
 export function deleteFile(fileId: string) {
@@ -155,28 +189,40 @@ export async function uploadAssetIntoFolder(folderId: string, asset: DocumentPic
       body = "";
     }
   }
+  const modified = typeof asset.lastModified === "number" && asset.lastModified > 0 ? new Date(asset.lastModified) : null;
   const file: WorkspaceFile = {
     id: `file-${Date.now()}`,
     name,
     detail: textFile ? "Uploaded" : "Uploaded file",
     body: textFile ? body : "This file is saved on this device. It isn't opened as text.",
     editable: textFile,
+    mimeType: asset.mimeType || undefined,
+    size: typeof asset.size === "number" ? asset.size : undefined,
+    modifiedAt: modified && !Number.isNaN(modified.getTime()) ? modified.toISOString() : new Date().toISOString(),
   };
   publishFile(folderId, file);
   return file;
 }
 
 export async function uploadIntoFolder(folderId: string) {
+  const saved = await uploadFilesIntoFolder(folderId);
+  return saved[0] ?? null;
+}
+
+export async function uploadFilesIntoFolder(folderId: string) {
   const result = await DocumentPicker.getDocumentAsync({
     copyToCacheDirectory: true,
-    multiple: false,
+    multiple: true,
   });
   if (result.canceled) {
-    return null;
+    return [];
   }
-  const asset = result.assets[0];
-  if (!asset) {
-    return null;
+  const saved: WorkspaceFile[] = [];
+  for (const asset of result.assets) {
+    const file = await uploadAssetIntoFolder(folderId, asset);
+    if (file) {
+      saved.push(file);
+    }
   }
-  return uploadAssetIntoFolder(folderId, asset);
+  return saved;
 }

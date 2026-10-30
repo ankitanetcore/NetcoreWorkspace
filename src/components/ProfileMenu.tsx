@@ -1,12 +1,15 @@
 import { useState } from "react";
-import { Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
+import { PhotoChooser } from "@/components/PhotoChooser";
+import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { useSession } from "@/session/Session";
+import type { ProfileInput } from "@/session/profile";
 import { webPointer } from "@/theme/pressable";
 import { colors, font } from "@/theme/tokens";
 
 export function ProfileMenu({ anchor }: { anchor: "rail" | "bar" }) {
-  const { name, rename } = useSession();
+  const { name, title, location, photoUri, updateProfile } = useSession();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
 
@@ -21,7 +24,7 @@ export function ProfileMenu({ anchor }: { anchor: "rail" | "bar" }) {
         {anchor === "rail" ? (
           <>
             <View style={styles.avatar}>
-              <Text style={styles.avatarLabel}>{initials(name)}</Text>
+              <ProfileAvatar name={name} photoUri={photoUri} size={36} backgroundColor={colors.navyRaised} color={colors.sidebarText} />
               <View style={styles.railDot} />
             </View>
             <Text style={styles.railName} numberOfLines={1}>
@@ -43,6 +46,8 @@ export function ProfileMenu({ anchor }: { anchor: "rail" | "bar" }) {
       {open ? (
         <ProfilePopover
           name={name}
+          title={title}
+          location={location}
           anchor={anchor}
           onClose={() => setOpen(false)}
           onEdit={() => {
@@ -54,9 +59,12 @@ export function ProfileMenu({ anchor }: { anchor: "rail" | "bar" }) {
       {editing ? (
         <EditProfileDialog
           name={name}
+          title={title}
+          location={location}
+          photoUri={photoUri}
           onClose={() => setEditing(false)}
           onSave={(next) => {
-            rename(next);
+            updateProfile(next);
             setEditing(false);
           }}
         />
@@ -67,11 +75,15 @@ export function ProfileMenu({ anchor }: { anchor: "rail" | "bar" }) {
 
 function ProfilePopover({
   name,
+  title,
+  location,
   anchor,
   onClose,
   onEdit,
 }: {
   name: string;
+  title: string;
+  location: string;
   anchor: "rail" | "bar";
   onClose: () => void;
   onEdit: () => void;
@@ -84,17 +96,22 @@ function ProfilePopover({
           <Text style={styles.profileName} numberOfLines={1}>
             {name}
           </Text>
+          {title || location ? (
+            <Text style={styles.profileDetail} numberOfLines={2}>
+              {[title, location].filter(Boolean).join(" · ")}
+            </Text>
+          ) : null}
           <View style={styles.statusRow}>
             <View style={[styles.onlineDot, styles.onlineDotCard]} />
             <Text style={styles.statusCard}>Online</Text>
           </View>
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel="Edit Profile"
+            accessibilityLabel="Settings"
             onPress={onEdit}
             style={({ pressed }) => [styles.edit, webPointer, pressed && styles.pressed]}
           >
-            <Text style={styles.editLabel}>Edit Profile</Text>
+            <Text style={styles.editLabel}>Settings</Text>
           </Pressable>
         </View>
       </View>
@@ -104,68 +121,97 @@ function ProfilePopover({
 
 function EditProfileDialog({
   name,
+  title,
+  location,
+  photoUri,
   onClose,
   onSave,
 }: {
   name: string;
+  title: string;
+  location: string;
+  photoUri: string;
   onClose: () => void;
-  onSave: (name: string) => void;
+  onSave: (profile: ProfileInput) => void;
 }) {
-  const [draft, setDraft] = useState(name);
-  const next = draft.trim();
+  const [draftName, setDraftName] = useState(name);
+  const [draftTitle, setDraftTitle] = useState(title);
+  const [draftLocation, setDraftLocation] = useState(location);
+  const [draftPhoto, setDraftPhoto] = useState(photoUri);
+  const next = draftName.trim();
 
   return (
     <Modal transparent visible animationType="fade" onRequestClose={onClose}>
       <View style={styles.scrim}>
         <Pressable accessibilityLabel="Close" style={styles.dismiss} onPress={onClose} />
         <View style={styles.dialog}>
-          <Text accessibilityRole="header" style={styles.dialogTitle}>
-            Edit Profile
-          </Text>
-          <Text style={styles.fieldLabel}>Display Name</Text>
-          <TextInput
-            value={draft}
-            onChangeText={setDraft}
-            onSubmitEditing={() => {
-              if (next) {
-                onSave(next);
-              }
-            }}
-            autoFocus
-            accessibilityLabel="Display Name"
-            style={[styles.input, Platform.OS === "web" ? { outlineWidth: 0 } : null]}
-          />
-          <View style={styles.actions}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Cancel"
-              onPress={onClose}
-              style={({ pressed }) => [styles.textButton, webPointer, pressed && styles.pressed]}
-            >
-              <Text style={styles.textButtonLabel}>Cancel</Text>
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Save Changes"
-              disabled={!next}
-              onPress={() => onSave(next)}
-              style={({ pressed }) => [styles.save, !next && styles.disabled, webPointer, pressed && next ? styles.pressed : null]}
-            >
-              <Text style={styles.saveLabel}>Save Changes</Text>
-            </Pressable>
-          </View>
+          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.dialogContent}>
+            <Text accessibilityRole="header" style={styles.dialogTitle}>
+              Settings
+            </Text>
+            <Text style={styles.fieldLabel}>
+              Your name <Text style={styles.required}>(Required)</Text>
+            </Text>
+            <TextInput
+              value={draftName}
+              onChangeText={setDraftName}
+              placeholder="e.g. Ankita"
+              placeholderTextColor={colors.faint}
+              autoFocus
+              autoCapitalize="words"
+              autoCorrect={false}
+              accessibilityLabel="Your name"
+              style={[styles.input, Platform.OS === "web" ? { outlineWidth: 0 } : null]}
+            />
+            <View style={styles.photoBlock}>
+              <PhotoChooser name={draftName} photoUri={draftPhoto} onChange={setDraftPhoto} />
+            </View>
+            <Text style={styles.fieldLabel}>Title</Text>
+            <TextInput
+              value={draftTitle}
+              onChangeText={setDraftTitle}
+              placeholder="e.g. Developer Relations Engineer"
+              placeholderTextColor={colors.faint}
+              autoCapitalize="words"
+              autoCorrect={false}
+              accessibilityLabel="Title"
+              style={[styles.input, Platform.OS === "web" ? { outlineWidth: 0 } : null]}
+            />
+            <Text style={styles.fieldLabel}>Location</Text>
+            <TextInput
+              value={draftLocation}
+              onChangeText={setDraftLocation}
+              placeholder="e.g. New York, NY"
+              placeholderTextColor={colors.faint}
+              autoCapitalize="words"
+              autoCorrect={false}
+              accessibilityLabel="Location"
+              style={[styles.input, Platform.OS === "web" ? { outlineWidth: 0 } : null]}
+            />
+            <View style={styles.actions}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel"
+                onPress={onClose}
+                style={({ pressed }) => [styles.textButton, webPointer, pressed && styles.pressed]}
+              >
+                <Text style={styles.textButtonLabel}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Save Changes"
+                disabled={!next}
+                onPress={() => onSave({ name: draftName, title: draftTitle, location: draftLocation, photoUri: draftPhoto })}
+                style={({ pressed }) => [styles.save, !next && styles.disabled, webPointer, pressed && next ? styles.pressed : null]}
+              >
+                <Text style={styles.saveLabel}>Save Changes</Text>
+              </Pressable>
+            </View>
+          </ScrollView>
         </View>
       </View>
     </Modal>
   );
-}
-
-function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return "?";
-  }
-  return parts[0].slice(0, 1).toUpperCase();
 }
 
 const styles = StyleSheet.create({
@@ -308,13 +354,31 @@ const styles = StyleSheet.create({
   },
   dialog: {
     width: "100%",
-    maxWidth: 360,
+    maxWidth: 480,
+    maxHeight: "88%",
     backgroundColor: colors.surface,
     borderRadius: 16,
     borderWidth: 1,
     borderColor: colors.line,
+  },
+  dialogContent: {
     padding: 20,
     gap: 8,
+  },
+  photoBlock: {
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  required: {
+    ...font.ui,
+    color: colors.faint,
+    fontWeight: "400",
+  },
+  profileDetail: {
+    ...font.content,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
   },
   dialogTitle: {
     ...font.brand,

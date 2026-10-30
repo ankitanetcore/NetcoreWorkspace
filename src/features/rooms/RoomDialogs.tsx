@@ -6,6 +6,7 @@ import { normalizeRoom } from "@/domain/membership";
 import { useSession } from "@/session/Session";
 import { createClientId } from "@/session/createClientId";
 import { currentClientId } from "@/session/currentIdentity";
+import { systemClientId } from "@/session/systemIdentity";
 import { webPointer } from "@/theme/pressable";
 import { colors, font, text } from "@/theme/tokens";
 import { getTransport } from "@/transport";
@@ -24,13 +25,13 @@ export function publishRooms(type: string, id: string, payload: unknown) {
 function readNamedPeers(): PresencePeer[] {
   return getTransport()
     .snapshot("presence")
-    .peers.filter((peer) => peer.displayName.length > 0)
+    .peers.filter((peer) => peer.clientId !== systemClientId && peer.displayName.length > 0)
     .slice()
     .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.clientId.localeCompare(right.clientId));
 }
 
 export function useKnownPeers() {
-  const { clientId, name } = useSession();
+  const { clientId, name, title, location, photoUri } = useSession();
   const [peers, setPeers] = useState(readNamedPeers);
 
   useEffect(() => {
@@ -39,11 +40,16 @@ export function useKnownPeers() {
     });
   }, []);
 
-  const known = peers.map((peer) => (peer.clientId === clientId && name ? { ...peer, displayName: name } : peer));
+  const known = peers.map((peer) =>
+    peer.clientId === clientId && name ? { ...peer, displayName: name, title, location, photoUri } : peer,
+  );
   if (clientId && name && !known.some((peer) => peer.clientId === clientId)) {
     known.unshift({
       clientId,
       displayName: name,
+      title,
+      location,
+      photoUri,
       status: "online",
       connectedAt: "",
     });
@@ -61,6 +67,17 @@ export function memberCount(room: Room, peers: PresencePeer[]) {
 
 export function memberLabel(count: number) {
   return `${count} ${count === 1 ? "member" : "members"}`;
+}
+
+export function roomMembers(room: Room, peers: PresencePeer[], selfId: string, selfName: string) {
+  const next = normalizeRoom(room);
+  const members =
+    next.access === "selected"
+      ? next.memberIds.map((id) => describePeer(peers, id, selfId, selfName))
+      : peers.slice();
+  return members.sort(
+    (left, right) => left.displayName.localeCompare(right.displayName) || left.clientId.localeCompare(right.clientId),
+  );
 }
 
 function describePeer(peers: PresencePeer[], id: string, selfId: string, selfName: string): PresencePeer {

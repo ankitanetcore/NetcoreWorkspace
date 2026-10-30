@@ -1,6 +1,11 @@
+import { cleanLine, cleanPhoto } from "@/session/profile";
+
 export interface StoredIdentity {
   clientId: string;
   displayName: string;
+  title?: string;
+  location?: string;
+  photoUri?: string;
 }
 
 const storageKey = "netcore.identity";
@@ -20,12 +25,29 @@ export function loadStoredIdentity(): StoredIdentity | null {
     if (!clientId || !displayName) {
       return null;
     }
-    return { clientId, displayName };
+    return {
+      clientId,
+      displayName,
+      title: cleanLine(typeof parsed.title === "string" ? parsed.title : ""),
+      location: cleanLine(typeof parsed.location === "string" ? parsed.location : ""),
+      photoUri: cleanPhoto(typeof parsed.photoUri === "string" ? parsed.photoUri : ""),
+    };
   } catch {
     return null;
   }
 }
 
 export function storeIdentity(identity: StoredIdentity) {
-  globalThis.localStorage.setItem(storageKey, JSON.stringify(identity));
+  const saved = {
+    clientId: identity.clientId,
+    displayName: identity.displayName,
+    title: cleanLine(identity.title),
+    location: cleanLine(identity.location),
+    photoUri: cleanPhoto(identity.photoUri),
+  };
+  try {
+    globalThis.localStorage.setItem(storageKey, JSON.stringify(saved));
+  } catch {
+    globalThis.localStorage.setItem(storageKey, JSON.stringify({ ...saved, photoUri: "" }));
+  }
 }

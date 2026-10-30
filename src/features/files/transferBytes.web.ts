@@ -10,6 +10,11 @@ import { getTransport } from "@/transport";
 
 const chunkSize = 16 * 1024;
 
+function modifiedStamp(lastModified?: number) {
+  const date = typeof lastModified === "number" && lastModified > 0 ? new Date(lastModified) : new Date();
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
   for (let index = 0; index < bytes.length; index += 1) {
@@ -109,6 +114,8 @@ async function prepareUpload(asset: DocumentPickerAsset, name: string) {
     mimeType,
     size: bytes.byteLength,
     clientId: clientId || undefined,
+    uploadedAt: new Date().toISOString(),
+    modifiedAt: modifiedStamp(asset.lastModified),
   };
   setFileDownload(file.id, URL.createObjectURL(new Blob([bytes as BlobPart], { type: mimeType })));
   return { file, bytes };

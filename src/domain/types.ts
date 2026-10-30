@@ -14,6 +14,11 @@ export interface SharedFileRef {
   size?: number;
 }
 
+export interface MessageReaction {
+  emoji: string;
+  authorIds: string[];
+}
+
 export interface RoomMessage {
   id: string;
   author: string;
@@ -24,6 +29,10 @@ export interface RoomMessage {
   format?: "markdown";
   file?: SharedFileRef;
   mine?: boolean;
+  parentId?: string;
+  inChannel?: boolean;
+  editedAt?: string;
+  reactions?: MessageReaction[];
 }
 
 export type RoomAccess = "everyone" | "selected";
@@ -60,12 +69,17 @@ export interface WorkspaceFile {
   size?: number;
   clientId?: string;
   audience?: FileAudience;
+  uploadedAt?: string;
+  modifiedAt?: string;
+  pinned?: boolean;
 }
 
 export interface WorkspaceFolder {
   id: string;
   name: string;
   files: WorkspaceFile[];
+  parentId?: string;
+  order?: number;
 }
 
 export interface FilesSnapshot {
@@ -88,6 +102,9 @@ export interface PresencePeer {
   displayName: string;
   status: "online" | "offline";
   connectedAt: string;
+  title?: string;
+  location?: string;
+  photoUri?: string;
 }
 
 export interface PresenceSnapshot {

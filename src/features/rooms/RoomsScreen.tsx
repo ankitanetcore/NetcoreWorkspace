@@ -12,35 +12,41 @@ import {
 } from "react-native";
 
 import { BackButton } from "@/components/BackButton";
+import { ProfileAvatar } from "@/components/ProfileAvatar";
+import { VideoIcon } from "@/components/ChatIcons";
 import { GeometricIcon } from "@/components/GeometricIcon";
 import { canAccessRoom, normalizeRoom } from "@/domain/membership";
 import type { PresencePeer, Room, RoomMessage, RoomsSnapshot } from "@/domain/types";
-import { useCallSession } from "@/features/call/CallSession";
+import { useCallControls, useCallSession } from "@/features/call/CallSession";
 import { DirectPane, Composer, type OutgoingMessage } from "@/features/direct/DirectPane";
 import { assetFromFile } from "@/features/files/desktopFile";
 import { FileDropSurface } from "@/features/files/FileDropSurface";
-import { SharedFileCard } from "@/features/files/SharedFileCard";
 import { readDirectThreads } from "@/features/direct/direct";
-import { continuesSender, previewText } from "@/features/messages/preview";
+import { DayDivider } from "@/features/messages/DayDivider";
+import { ChatMessage } from "@/features/messages/ChatMessage";
+import { editInRoom, reactInRoom, replyInRoom } from "@/features/messages/messageActions";
+import { channelMessages, continuesSender, previewText, repliesTo } from "@/features/messages/preview";
+import { sentDay } from "@/features/messages/sentWhen";
+import { ThreadPanel } from "@/features/messages/ThreadPanel";
 import { clearSelection, selectDirect, selectRoom, useConversationSelection } from "@/features/messages/selection";
 import { markRead } from "@/features/messages/readState";
 import {
   CreateRoomDialog,
   DeleteRoomDialog,
-  memberCount,
-  memberLabel,
   MembersDialog,
   publishRooms,
   RenameRoomDialog,
+  roomMembers,
   RoomOptionsMenu,
   useKnownPeers,
 } from "@/features/rooms/RoomDialogs";
+import { RoomMemberAvatars } from "@/features/rooms/RoomMemberAvatars";
 import { roomIcon } from "@/features/rooms/roomIcons";
-import { columnTextStyle } from "@/features/messages/columnText";
 import { displayNameFor } from "@/session/displayName";
 import { useSession } from "@/session/Session";
 import { currentClientId } from "@/session/currentIdentity";
-import { webPointer } from "@/theme/pressable";
+import { workspaceHostId } from "@/session/host";
+import { webMotion, webPointer } from "@/theme/pressable";
 import { colors, font, layout, text } from "@/theme/tokens";
 import { getTransport } from "@/transport";
 import type { TransportEnvelope } from "@/transport/types";
@@ -91,10 +97,19 @@ export function RoomsScreen() {
   }, [selection, snapshot.rooms]);
 
   useEffect(() => {
-    if (split && selection === null && snapshot.rooms[0]) {
+    if (selection !== null) {
+      return;
+    }
+    const me = currentClientId();
+    const hostId = workspaceHostId();
+    if (hostId && me && hostId !== me && threads.some((thread) => thread.participantIds.includes(hostId))) {
+      selectDirect(hostId);
+      return;
+    }
+    if (split && snapshot.rooms[0]) {
       selectRoom(snapshot.rooms[0].id);
     }
-  }, [split, selection, snapshot.rooms]);
+  }, [split, selection, snapshot.rooms, threads]);
 
   const selected = selection?.kind === "room" ? (snapshot.rooms.find((room) => room.id === selection.id) ?? null) : null;
   const peerId = selection?.kind === "direct" ? selection.peerId : null;
@@ -165,17 +180,6 @@ function readPresence(): PresencePeer[] {
     });
 }
 
-function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return "";
-  }
-  if (parts.length === 1) {
-    return parts[0].slice(0, 1).toUpperCase();
-  }
-  return `${parts[0].slice(0, 1)}${parts[1].slice(0, 1)}`.toUpperCase();
-}
-
 function PresenceBlock({ nested = false }: { nested?: boolean }) {
   const { clientId } = useSession();
   const [peers, setPeers] = useState(readPresence);
@@ -212,7 +216,13 @@ function PresenceBlock({ nested = false }: { nested?: boolean }) {
           >
             {shown.map((peer, index) => (
               <View key={peer.clientId} style={[styles.avatar, index > 0 && styles.avatarOverlap]}>
-                <Text style={styles.avatarLabel}>{initials(peer.displayName)}</Text>
+                <ProfileAvatar
+                  name={peer.displayName}
+                  photoUri={peer.photoUri}
+                  size={20}
+                  backgroundColor={colors.navy}
+                  color={colors.youText}
+                />
               </View>
             ))}
             {extra > 0 ? (
@@ -363,19 +373,28 @@ function Thread({
   onBack?: () => void;
 }) {
   const { name, clientId } = useSession();
-  const { startCall, requestJoin } = useCallSession();
+  const { openLobby, requestJoin, restore, roomId: activeRoomId } = useCallSession();
+  const liveControls = useCallControls();
   const peers = useKnownPeers();
   const call = useActiveRoomCall(room.id);
-  const incoming = call && !call.participantIds.includes(clientId) ? call : null;
+  const inThisCall = activeRoomId === room.id;
+  const incoming = call && !inThisCall && !call.participantIds.includes(clientId) ? call : null;
   const [menuOpen, setMenuOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const count = memberCount(room, peers);
+  const { width } = useWindowDimensions();
+  const compact = width < layout.desktopMinWidth;
+  const members = roomMembers(room, peers, clientId, name);
+  const participantCount = call ? call.participantIds.length : inThisCall ? (liveControls?.participants.length ?? 0) + 1 : 0;
+  const callAction = inThisCall ? "return" : call ? "join" : "start";
   const listRef = useRef<ScrollView>(null);
   const stickToEnd = useRef(true);
   const [dropped, setDropped] = useState<DocumentPickerAsset | null>(null);
   const [droppedExtra, setDroppedExtra] = useState(0);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const timeline = channelMessages(room.messages);
+  const threadRoot = room.messages.find((message) => message.id === threadId && !message.parentId);
 
   useEffect(() => {
     setMenuOpen(false);
@@ -384,6 +403,7 @@ function Thread({
     setConfirming(false);
     setDropped(null);
     setDroppedExtra(0);
+    setThreadId(null);
   }, [room.id]);
 
   useEffect(() => {
@@ -403,12 +423,32 @@ function Thread({
     setRenaming(false);
   }
 
+  function onCallPress() {
+    if (inThisCall) {
+      restore();
+      return;
+    }
+    if (call) {
+      requestJoin({
+        roomId: room.id,
+        roomName: room.name,
+        startedBy: call.startedBy,
+        startedName: displayNameFor(peers, call.startedBy, call.startedName, { clientId, name }),
+      });
+      return;
+    }
+    openLobby({ roomId: room.id, roomName: room.name, mode: "start" });
+  }
+
+  const callLabel = callAction === "return" ? "Return to call" : callAction === "join" ? "Join call" : "Start call";
+  const callLive = callAction !== "start";
+
   return (
     <View style={styles.thread}>
       <View style={[styles.threadHeader, onBack ? null : styles.alignedHeader]}>
         {onBack ? <BackButton onPress={onBack} /> : null}
-        <View style={styles.threadTitleRow}>
-          <View style={styles.threadTitle}>
+        <View style={[styles.threadTitleRow, compact && styles.threadTitleWrap]}>
+          <View style={[styles.threadTitle, compact && styles.threadTitleFill]}>
             <View style={styles.glyphActive}>
               <GeometricIcon name={roomIcon(room.id)} size={16} color={colors.burgundy} />
             </View>
@@ -416,33 +456,49 @@ function Thread({
               {room.name}
             </Text>
           </View>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={memberLabel(count)}
-            onPress={() => setMembersOpen(true)}
-            style={({ pressed }) => [webPointer, pressed && styles.pressed]}
-          >
-            <Text style={styles.memberCount}>{memberLabel(count)}</Text>
-          </Pressable>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Room options"
-            onPress={() => setMenuOpen(true)}
-            style={({ pressed }) => [styles.overflowButton, webPointer, pressed && styles.pressed]}
-          >
-            <Text style={styles.overflowLabel}>•••</Text>
-          </Pressable>
-          {call ? null : (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Start call in ${room.name}`}
-              onPress={() => startCall(room.id)}
-              style={({ pressed }) => [styles.callButton, webPointer, pressed && styles.pressed]}
-            >
-              <GeometricIcon name="call" size={16} color={colors.youText} />
-              <Text style={styles.callLabel}>Start Call</Text>
-            </Pressable>
-          )}
+          <View style={[styles.headerMeta, compact && styles.headerMetaCompact]}>
+            <RoomMemberAvatars key={room.id} members={members} selfId={clientId} />
+            <View style={styles.headerActions}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Room options"
+                onPress={() => setMenuOpen(true)}
+                style={({ pressed }) => [styles.overflowButton, webPointer, pressed && styles.pressed]}
+              >
+                <Text style={styles.overflowLabel}>•••</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={
+                  callAction === "return"
+                    ? `Return to call in ${room.name}`
+                    : callAction === "join"
+                      ? `Join call in ${room.name}`
+                      : `Start call in ${room.name}`
+                }
+                onPress={onCallPress}
+                style={({ pressed, hovered }) => [
+                  styles.callButton,
+                  callLive && styles.callButtonLive,
+                  hovered && (callLive ? styles.callButtonLiveHover : styles.callButtonHover),
+                  pressed && (callLive ? styles.callButtonLivePressed : styles.callButtonPressed),
+                  webPointer,
+                  webMotion,
+                ]}
+              >
+                {callLive ? null : <VideoIcon size={18} color={colors.navy} strokeWidth={1.75} />}
+                <Text style={[styles.callButtonLabel, callLive && styles.callButtonLabelLive]}>{callLabel}</Text>
+              </Pressable>
+              {callLive ? (
+                <View style={styles.callStatus} accessibilityLabel={`${participantCount} in call`}>
+                  <View style={styles.callStatusDot} />
+                  <Text style={styles.callStatusText}>
+                    {participantCount} in call
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          </View>
         </View>
         {showPresence ? <PresenceBlock nested /> : null}
       </View>
@@ -468,6 +524,7 @@ function Thread({
           </Pressable>
         </View>
       ) : null}
+      <View style={styles.conversation}>
       <FileDropSurface
         label={`Drop a file to attach it in ${room.name}. You still press Send.`}
         onFiles={(files) => {
@@ -479,7 +536,7 @@ function Thread({
           setDroppedExtra(rest.length);
         }}
       >
-      {room.messages.length === 0 ? (
+      {timeline.length === 0 ? (
         <View style={styles.empty}>
           <Text style={[text.meta, font.content]}>No messages yet</Text>
         </View>
@@ -498,17 +555,31 @@ function Thread({
             }
           }}
         >
-          {room.messages.map((message, index) => (
-            <Message
-              key={message.id}
-              message={message}
-              grouped={continuesSender(room.messages[index - 1], message)}
-              author={displayNameFor(peers, message.authorId, message.author, { clientId, name })}
-            />
-          ))}
+          {timeline.map((message, index) => {
+            const day = sentDay(message.sentAt);
+            const previous = timeline[index - 1];
+            const previousDay = sentDay(previous?.sentAt);
+            return (
+              <View key={message.id} style={styles.messageBlock}>
+                {day && day !== previousDay ? <DayDivider label={day} /> : null}
+                <ChatMessage
+                  message={message}
+                  grouped={continuesSender(previous, message)}
+                  author={displayNameFor(peers, message.authorId, message.author, { clientId, name })}
+                  mine={Boolean(clientId) && message.authorId === clientId}
+                  replyCount={message.parentId ? 0 : repliesTo(room.messages, message.id).length}
+                  linked={Boolean(message.parentId)}
+                  onReact={(emoji) => reactInRoom(room.id, message.id, emoji)}
+                  onEdit={(body) => editInRoom(room.id, message, body)}
+                  onReply={() => setThreadId(message.parentId || message.id)}
+                />
+              </View>
+            );
+          })}
         </ScrollView>
       )}
       <Composer
+        conversationName={room.name}
         audience={{ kind: "room", roomId: room.id }}
         dropped={dropped}
         droppedExtra={droppedExtra}
@@ -537,6 +608,21 @@ function Thread({
         }}
       />
       </FileDropSurface>
+      {threadRoot ? (
+        <ThreadPanel
+          messages={room.messages}
+          parentId={threadRoot.id}
+          audience="room"
+          overlay={width < 1180}
+          authorFor={(message) => displayNameFor(peers, message.authorId, message.author, { clientId, name })}
+          mineFor={(message) => Boolean(clientId) && message.authorId === clientId}
+          onReact={(messageId, emoji) => reactInRoom(room.id, messageId, emoji)}
+          onEdit={(message, body) => editInRoom(room.id, message, body)}
+          onReply={(body, inChannel) => replyInRoom(room.id, threadRoot.id, body, name, inChannel)}
+          onClose={() => setThreadId(null)}
+        />
+      ) : null}
+      </View>
       {menuOpen ? (
         <RoomOptionsMenu
           onClose={() => setMenuOpen(false)}
@@ -574,28 +660,6 @@ function Thread({
           }}
         />
       ) : null}
-    </View>
-  );
-}
-
-function Message({ message, grouped, author }: { message: RoomMessage; grouped: boolean; author: string }) {
-  const { clientId } = useSession();
-  const mine = Boolean(clientId) && message.authorId === clientId;
-  const attachmentOnly = Boolean(message.file) && !message.body?.trim();
-  return (
-    <View style={[styles.message, mine && styles.messageMine, grouped && styles.messageGrouped]}>
-      {grouped ? null : (
-        <View style={styles.messageMeta}>
-          <Text style={styles.author}>{author}</Text>
-          <Text style={styles.time}>{message.time}</Text>
-        </View>
-      )}
-      {message.body?.trim() ? (
-        <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubbleOther]}>
-          <Text style={[styles.messageBody, columnTextStyle(message.body)]}>{message.body}</Text>
-        </View>
-      ) : null}
-      {message.file ? <SharedFileCard file={message.file} solo={attachmentOnly} suggest={mine} /> : null}
     </View>
   );
 }
@@ -873,6 +937,13 @@ const styles = StyleSheet.create({
     minHeight: 0,
     backgroundColor: colors.background,
   },
+  conversation: {
+    flex: 1,
+    minHeight: 0,
+    minWidth: 0,
+    flexDirection: "row",
+    position: "relative",
+  },
   empty: {
     flex: 1,
     alignItems: "center",
@@ -886,30 +957,54 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.line,
     backgroundColor: colors.background,
     gap: 8,
+    zIndex: 5,
   },
   threadTitleRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
+    minWidth: 0,
+  },
+  threadTitleWrap: {
+    flexWrap: "wrap",
+    rowGap: 10,
   },
   threadTitle: {
-    flex: 1,
+    flexShrink: 1,
     minWidth: 0,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
+  },
+  threadTitleFill: {
+    flexGrow: 1,
+    flexBasis: "100%",
   },
   threadName: {
     ...font.brand,
     flex: 1,
     fontWeight: "700",
   },
-  memberCount: {
-    ...font.content,
-    color: colors.muted,
-    fontSize: 13,
-    lineHeight: 18,
-    fontWeight: "500",
+  headerMeta: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  headerMetaCompact: {
+    flexGrow: 1,
+    flexBasis: "100%",
+    flexWrap: "wrap",
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 8,
+    flexShrink: 0,
+    marginLeft: "auto",
   },
   overflowButton: {
     width: 32,
@@ -928,11 +1023,60 @@ const styles = StyleSheet.create({
   callButton: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center",
     gap: 8,
-    height: 32,
-    paddingHorizontal: 12,
-    borderRadius: 16,
-    backgroundColor: colors.navy,
+    height: 44,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    flexShrink: 0,
+  },
+  callButtonHover: {
+    backgroundColor: "#F6F1EA",
+  },
+  callButtonPressed: {
+    backgroundColor: colors.surfaceMuted,
+  },
+  callButtonLive: {
+    backgroundColor: "#D8EAD9",
+    borderColor: "rgba(41, 92, 67, 0.28)",
+  },
+  callButtonLiveHover: {
+    backgroundColor: "#CDE3D0",
+  },
+  callButtonLivePressed: {
+    backgroundColor: "#C0D9C4",
+  },
+  callButtonLabel: {
+    ...font.ui,
+    color: colors.navy,
+    fontSize: 14,
+    lineHeight: 18,
+    fontWeight: "500",
+  },
+  callButtonLabelLive: {
+    color: "#295C43",
+  },
+  callStatus: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 0,
+  },
+  callStatusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#3D8C62",
+  },
+  callStatusText: {
+    ...font.content,
+    color: "#295C43",
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "500",
   },
   callLabel: {
     ...font.ui,
@@ -1013,6 +1157,10 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 16,
     gap: 18,
+  },
+  messageBlock: {
+    alignSelf: "stretch",
+    gap: 8,
   },
   message: {
     alignSelf: "flex-start",

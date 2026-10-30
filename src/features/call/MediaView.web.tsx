@@ -2,7 +2,15 @@ import { useEffect, useRef } from "react";
 import { createElement } from "react";
 import { View } from "react-native";
 
-export function MediaView({ stream, silent }: { stream: unknown; silent: boolean }) {
+export function MediaView({
+  stream,
+  silent,
+  fit = "cover",
+}: {
+  stream: unknown;
+  silent: boolean;
+  fit?: "contain" | "cover";
+}) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const media = stream instanceof MediaStream ? stream : null;
   const trackKey = media?.getTracks().map((track) => track.id).join(",") ?? "";
@@ -44,7 +52,7 @@ export function MediaView({ stream, silent }: { stream: unknown; silent: boolean
         style: {
           width: "100%",
           height: "100%",
-          objectFit: "cover",
+          objectFit: fit,
           backgroundColor: "#243044",
         },
       })}

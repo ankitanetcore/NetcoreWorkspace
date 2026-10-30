@@ -15,7 +15,9 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
   return {
     muted,
     cameraOff,
+    sharing: false,
     localStream: null,
+    screenStream: null,
     participants: [],
     toggleMute() {
       setMuted((value) => !value);
@@ -23,6 +25,7 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
     toggleCamera() {
       setCameraOff((value) => !value);
     },
+    toggleScreenShare() {},
     leave() {
       onEndedRef.current?.();
     },

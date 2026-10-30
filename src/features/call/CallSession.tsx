@@ -4,6 +4,7 @@ import { Platform, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { CallAudioSink } from "@/features/call/CallAudioSink";
+import { CallLobby, type CallEntry } from "@/features/call/CallLobby";
 import { IncomingCallNotice } from "@/features/call/IncomingCallNotice";
 import { MiniCall } from "@/features/call/MiniCall";
 import type { RoomCallControls } from "@/features/call/roomCallTypes";
@@ -33,6 +34,7 @@ interface CallApi {
   roomId: string | null;
   holdRoomId: string | null;
   startCall: (roomId: string) => void;
+  openLobby: (entry: CallEntry) => void;
   requestJoin: (call: IncomingCall) => void;
   minimize: () => void;
   restore: () => void;
@@ -92,6 +94,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [notice, setNotice] = useState<IncomingCall | null>(null);
   const [ringing, setRinging] = useState(false);
   const [confirm, setConfirm] = useState<IncomingCall | null>(null);
+  const [lobby, setLobby] = useState<CallEntry | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const nameRef = useRef(name);
   const clientIdRef = useRef(clientId);
@@ -138,6 +141,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (confirmRef.current?.roomId === target) {
       setConfirm(null);
     }
+    setLobby((current) => (current?.roomId === target ? null : current));
   }, []);
 
   const describe = useCallback((call: RawCall): IncomingCall => {
@@ -248,10 +252,38 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [router],
   );
 
-  const requestJoin = useCallback((call: IncomingCall) => {
-    setConfirm(call);
+  const openLobby = useCallback((entry: CallEntry) => {
+    const id = entry.roomId.trim();
+    if (!id || roomIdRef.current === id) {
+      return;
+    }
+    setLobby({ ...entry, roomId: id });
     setRinging(false);
   }, []);
+
+  const requestJoin = useCallback(
+    (call: IncomingCall) => {
+      openLobby({
+        roomId: call.roomId,
+        roomName: call.roomName,
+        mode: "join",
+        startedBy: call.startedBy,
+        startedName: call.startedName,
+      });
+    },
+    [openLobby],
+  );
+
+  const cancelLobby = useCallback(() => {
+    setLobby(null);
+    if (!roomIdRef.current && onCallPath(pathnameRef.current)) {
+      if (router.canGoBack()) {
+        router.back();
+      } else {
+        router.replace("/rooms");
+      }
+    }
+  }, [router]);
 
   const dismissIncoming = useCallback(() => {
     if (noticeRef.current) {
@@ -280,6 +312,24 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [router],
   );
 
+  const confirmLobby = useCallback(() => {
+    const entry = lobby;
+    if (!entry) {
+      return;
+    }
+    setLobby(null);
+    if (entry.mode === "join") {
+      acceptJoin({
+        roomId: entry.roomId,
+        roomName: entry.roomName,
+        startedBy: entry.startedBy,
+        startedName: entry.startedName ?? "Someone",
+      });
+      return;
+    }
+    startCall(entry.roomId);
+  }, [acceptJoin, lobby, startCall]);
+
   const minimize = useCallback(() => {
     if (router.canGoBack()) {
       router.back();
@@ -297,8 +347,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
   }, [router]);
 
   const api = useMemo<CallApi>(
-    () => ({ roomId, holdRoomId, startCall, requestJoin, minimize, restore }),
-    [roomId, holdRoomId, startCall, requestJoin, minimize, restore],
+    () => ({ roomId, holdRoomId, startCall, openLobby, requestJoin, minimize, restore }),
+    [roomId, holdRoomId, startCall, openLobby, requestJoin, minimize, restore],
   );
 
   return (
@@ -329,6 +379,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
             {roomId && controls && !onCallPath(pathname) ? (
               <MiniCall call={controls} bottomInset={insets.bottom} onRestore={restore} />
             ) : null}
+            {lobby ? <CallLobby entry={lobby} onCancel={cancelLobby} onConfirm={confirmLobby} /> : null}
           </View>
         </View>
       </LiveCallContext.Provider>

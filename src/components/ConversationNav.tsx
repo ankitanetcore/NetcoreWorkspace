@@ -2,15 +2,15 @@ import { useRouter, usePathname } from "expo-router";
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
-import { GeometricIcon } from "@/components/GeometricIcon";
+import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { canAccessRoom, normalizeRoom } from "@/domain/membership";
-import type { DirectThread, Room } from "@/domain/types";
+import type { DirectThread, Room, RoomMessage } from "@/domain/types";
 import { readDirectThreads } from "@/features/direct/direct";
 import { selectDirect, selectRoom, useConversationSelection } from "@/features/messages/selection";
-import { previewText } from "@/features/messages/preview";
+import { channelMessages, previewText } from "@/features/messages/preview";
+import { sentDay } from "@/features/messages/sentWhen";
 import { unreadCount, useReadVersion } from "@/features/messages/readState";
 import { CreateRoomDialog, useKnownPeers } from "@/features/rooms/RoomDialogs";
-import { roomIcon } from "@/features/rooms/roomIcons";
 import { displayNameFor } from "@/session/displayName";
 import { useSession } from "@/session/Session";
 import { currentClientId } from "@/session/currentIdentity";
@@ -71,13 +71,10 @@ export function ConversationNav() {
     .map((thread) => ({ thread, peerId: thread.participantIds.find((id) => id !== clientId) ?? "" }))
     .filter((item) => item.peerId)
     .sort((left, right) => lastActivity(right.thread) - lastActivity(left.thread));
-  const visibleRooms = rooms.filter((room) => !needle || room.name.toLowerCase().includes(needle));
-  const visibleRecent = recent.filter(({ peerId }) => {
-    if (!needle) {
-      return true;
-    }
+  const visibleRooms = rooms.filter((room) => matchesConversation(room.name, room.messages, needle));
+  const visibleRecent = recent.filter(({ thread, peerId }) => {
     const peer = peers.find((item) => item.clientId === peerId);
-    return (peer?.displayName || peerId).toLowerCase().includes(needle);
+    return matchesConversation(peer?.displayName || peerId, thread.messages, needle);
   });
 
   return (
@@ -89,9 +86,9 @@ export function ConversationNav() {
         <TextInput
           value={query}
           onChangeText={setQuery}
-          placeholder="Search"
+          placeholder="Search messages"
           placeholderTextColor={colors.sidebarMuted}
-          accessibilityLabel="Search conversations"
+          accessibilityLabel="Search messages"
           autoCapitalize="none"
           autoCorrect={false}
           style={styles.search}
@@ -112,7 +109,7 @@ export function ConversationNav() {
           </View>
           {visibleRooms.length === 0 ? <Text style={styles.empty}>No matches</Text> : null}
           {visibleRooms.map((room) => {
-            const last = room.messages[room.messages.length - 1];
+            const last = previewMessage(room.messages, needle);
             const unread = unreadCount(room.id, room.messages, clientId);
             const active = onRooms && selection?.kind === "room" && selection.id === room.id;
             return (
@@ -131,12 +128,17 @@ export function ConversationNav() {
                 ]}
               >
                 <View style={[styles.iconChip, { backgroundColor: roomTone(room.id).bg }]}>
-                  <GeometricIcon name={roomIcon(room.id)} size={12} color={roomTone(room.id).icon} />
+                  <Text style={[styles.roomLetter, { color: roomTone(room.id).icon }]}>
+                    {room.name.trim().charAt(0).toUpperCase() || "?"}
+                  </Text>
                 </View>
                 <View style={styles.copy}>
-                  <Text style={[styles.name, active && styles.nameActive, unread > 0 && styles.nameUnread]} numberOfLines={1}>
-                    {room.name}
-                  </Text>
+                  <View style={styles.titleLine}>
+                    <Text style={[styles.name, active && styles.nameActive, unread > 0 && styles.nameUnread]} numberOfLines={1}>
+                      {room.name}
+                    </Text>
+                    <SentWhen sentAt={last?.sentAt} />
+                  </View>
                   <Text style={[styles.preview, unread > 0 && styles.previewUnread]} numberOfLines={1}>
                     {last ? `${displayNameFor(peers, last.authorId, last.author, { clientId, name })}: ${previewText(last)}` : "No messages yet"}
                   </Text>
@@ -163,7 +165,7 @@ export function ConversationNav() {
           ) : null}
           {visibleRecent.map(({ thread, peerId }) => {
             const peer = peers.find((item) => item.clientId === peerId);
-            const last = thread.messages[thread.messages.length - 1];
+            const last = previewMessage(thread.messages, needle);
             const unread = unreadCount(thread.id, thread.messages, clientId);
             const active = onRooms && selection?.kind === "direct" && selection.peerId === peerId;
             return (
@@ -182,13 +184,22 @@ export function ConversationNav() {
                 ]}
               >
                 <View style={styles.avatar}>
-                  <Text style={styles.avatarLabel}>{initials(peer?.displayName || "")}</Text>
+                  <ProfileAvatar
+                    name={peer?.displayName || ""}
+                    photoUri={peer?.photoUri}
+                    size={22}
+                    backgroundColor="#3A2E32"
+                    color="#E4C8CB"
+                  />
                   <View style={[styles.presence, peer?.status === "online" ? styles.dotOnline : styles.dotOffline]} />
                 </View>
                 <View style={styles.copy}>
-                  <Text style={[styles.name, active && styles.nameActive, unread > 0 && styles.nameUnread]} numberOfLines={1}>
-                    {peer?.displayName || peerId.slice(0, 8)}
-                  </Text>
+                  <View style={styles.titleLine}>
+                    <Text style={[styles.name, active && styles.nameActive, unread > 0 && styles.nameUnread]} numberOfLines={1}>
+                      {peer?.displayName || peerId.slice(0, 8)}
+                    </Text>
+                    <SentWhen sentAt={last?.sentAt} />
+                  </View>
                   <Text style={[styles.preview, unread > 0 && styles.previewUnread]} numberOfLines={1}>
                     {last ? previewText(last) : "No messages yet"}
                   </Text>
@@ -227,18 +238,44 @@ function roomTone(id: string) {
   return roomTones[hash];
 }
 
-function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return "?";
+function matchesConversation(label: string, messages: RoomMessage[], needle: string) {
+  if (!needle) {
+    return true;
   }
-  return parts[0].slice(0, 1).toUpperCase();
+  if (label.toLowerCase().includes(needle)) {
+    return true;
+  }
+  return messages.some((message) => previewText(message).toLowerCase().includes(needle));
+}
+
+function previewMessage(messages: RoomMessage[], needle: string) {
+  if (needle) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (previewText(message).toLowerCase().includes(needle)) {
+        return message;
+      }
+    }
+  }
+  const visible = channelMessages(messages);
+  for (let index = visible.length - 1; index >= 0; index -= 1) {
+    return visible[index];
+  }
+  return undefined;
 }
 
 function lastActivity(thread: DirectThread) {
   const last = thread.messages[thread.messages.length - 1];
   const sent = last?.sentAt ? Date.parse(last.sentAt) : 0;
   return Number.isNaN(sent) ? 0 : sent;
+}
+
+function SentWhen({ sentAt }: { sentAt?: string }) {
+  const label = sentDay(sentAt);
+  if (!label) {
+    return null;
+  }
+  return <Text style={styles.when} numberOfLines={1}>{label}</Text>;
 }
 
 const styles = StyleSheet.create({
@@ -250,8 +287,8 @@ const styles = StyleSheet.create({
   heading: {
     ...font.brand,
     color: colors.sidebarText,
-    fontSize: 20,
-    lineHeight: 26,
+    fontSize: 18,
+    lineHeight: 24,
     fontWeight: "700",
   },
   search: {
@@ -261,7 +298,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     backgroundColor: colors.navyRaised,
     color: colors.sidebarText,
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: "400",
   },
   scroll: {
@@ -288,8 +325,8 @@ const styles = StyleSheet.create({
   sectionLabel: {
     ...font.ui,
     color: colors.sidebarMuted,
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 12,
+    lineHeight: 16,
     fontWeight: "500",
   },
   add: {
@@ -322,6 +359,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  roomLetter: {
+    ...font.ui,
+    fontSize: 12,
+    lineHeight: 14,
+    fontWeight: "700",
+  },
   avatar: {
     width: 22,
     height: 22,
@@ -352,11 +395,17 @@ const styles = StyleSheet.create({
     minWidth: 0,
     gap: 2,
   },
+  titleLine: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 8,
+  },
   name: {
     ...font.ui,
+    flexShrink: 1,
     color: colors.sidebarText,
-    fontSize: 15,
-    lineHeight: 20,
+    fontSize: 13,
+    lineHeight: 18,
     fontWeight: "600",
   },
   nameActive: {
@@ -365,11 +414,20 @@ const styles = StyleSheet.create({
   nameUnread: {
     fontWeight: "600",
   },
+  when: {
+    ...font.content,
+    flexShrink: 0,
+    marginLeft: "auto",
+    color: colors.sidebarMuted,
+    fontSize: 11,
+    lineHeight: 16,
+    fontWeight: "400",
+  },
   preview: {
     ...font.content,
     color: colors.sidebarMuted,
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 12,
+    lineHeight: 16,
     fontWeight: "400",
   },
   previewUnread: {

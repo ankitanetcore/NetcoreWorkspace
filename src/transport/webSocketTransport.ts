@@ -3,6 +3,7 @@ import type { RoomMessage, WorkspaceFile } from "@/domain/types";
 import { fileDownloadUrl, forgetFileDownload, setFileDownload } from "@/features/files/downloads";
 import { reportTransferFailure } from "@/features/files/transferNotice";
 import { currentClientId } from "@/session/currentIdentity";
+import { setWorkspaceHost } from "@/session/host";
 import { loadStoredIdentity } from "@/session/deviceStorage";
 import { bindPresenceSender } from "@/session/presence";
 import { applyEnvelope } from "@/transport/applyEnvelope";
@@ -120,6 +121,7 @@ interface WorkspaceSnapshot {
   direct?: TransportSnapshots["direct"];
   files?: TransportSnapshots["files"];
   calls?: ActiveCall[];
+  hostClientId?: string;
 }
 
 function readActiveCall(call: ActiveCall) {
@@ -201,7 +203,13 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
         type: "hello",
         sentAt: new Date().toISOString(),
         clientId: identity.clientId,
-        payload: { clientId: identity.clientId, displayName },
+        payload: {
+          clientId: identity.clientId,
+          displayName,
+          title: identity.title || "",
+          location: identity.location || "",
+          photoUri: identity.photoUri || "",
+        },
       }),
     );
   }
@@ -318,6 +326,9 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
   }
 
   function applySnapshot(payload: WorkspaceSnapshot) {
+    if (typeof payload.hostClientId === "string") {
+      setWorkspaceHost(payload.hostClientId);
+    }
     if (payload.rooms) {
       const clientId = currentClientId();
       snapshots.rooms = {

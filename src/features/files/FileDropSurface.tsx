@@ -73,10 +73,11 @@ export function FileDropSurface({
       event.stopPropagation();
       depth.current = 0;
       setOver(false);
-      const files = filesFromDrop(event);
-      if (files.length > 0) {
-        onFilesRef.current(files);
-      }
+      void filesFromDrop(event).then((files) => {
+        if (files.length > 0) {
+          onFilesRef.current(files);
+        }
+      });
     }
 
     element.addEventListener("dragenter", enter);

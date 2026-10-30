@@ -178,17 +178,34 @@ export function SharedFileCard({
                 ) : null}
                 {downloadUrl ? <FileDownload url={downloadUrl} name={file.name} tone="icon" /> : null}
                 {folder ? null : (
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel={`Attachment options for ${file.name}`}
-                    onPress={() => {
-                      setPreviewPicking(false);
-                      setMenu((value) => !value);
-                    }}
-                    style={({ pressed, hovered }) => [styles.more, webPointer, (pressed || hovered) && styles.cardHover]}
-                  >
-                    <Text style={styles.moreLabel}>•••</Text>
-                  </Pressable>
+                  <View style={styles.moreAnchor}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Attachment options for ${file.name}`}
+                      onPress={() => {
+                        setPreviewPicking(false);
+                        setMenu((value) => !value);
+                      }}
+                      style={({ pressed, hovered }) => [styles.more, webPointer, (pressed || hovered) && styles.cardHover]}
+                    >
+                      <Text style={styles.moreLabel}>•••</Text>
+                    </Pressable>
+                    {menu ? (
+                      <View style={styles.menu}>
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={`Add ${file.name} to Files`}
+                          onPress={() => {
+                            setMenu(false);
+                            setPreviewPicking(true);
+                          }}
+                          style={({ pressed, hovered }) => [styles.menuItem, webPointer, (pressed || hovered) && styles.cardHover]}
+                        >
+                          <Text style={styles.menuLabel}>Add to Files</Text>
+                        </Pressable>
+                      </View>
+                    ) : null}
+                  </View>
                 )}
                 <Pressable
                   accessibilityRole="button"
@@ -200,21 +217,6 @@ export function SharedFileCard({
                 </Pressable>
               </View>
             </View>
-            {menu && !folder ? (
-              <View style={styles.menu}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`Add ${file.name} to Files`}
-                  onPress={() => {
-                    setMenu(false);
-                    setPreviewPicking(true);
-                  }}
-                  style={({ pressed, hovered }) => [styles.menuItem, webPointer, (pressed || hovered) && styles.cardHover]}
-                >
-                  <Text style={styles.menuLabel}>Add to Files</Text>
-                </Pressable>
-              </View>
-            ) : null}
             {previewPicking && !folder ? <FolderPicker folders={folders} onSave={saveTo} /> : null}
             <View style={styles.previewBody}>
               {image && downloadUrl ? <PreviewImage url={downloadUrl} /> : null}
@@ -524,6 +526,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 4,
   },
+  moreAnchor: {
+    position: "relative",
+  },
   more: {
     width: 28,
     height: 28,
@@ -546,7 +551,11 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   menu: {
-    alignSelf: "flex-end",
+    position: "absolute",
+    right: 0,
+    bottom: "100%",
+    marginBottom: 6,
+    zIndex: 4,
     minWidth: 160,
     borderWidth: 1,
     borderColor: colors.line,

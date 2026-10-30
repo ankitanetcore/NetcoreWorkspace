@@ -49,3 +49,4 @@ tmp/
 
 # local workspace session
 server/data/
+server/data-*/

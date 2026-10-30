@@ -1,19 +1,103 @@
 import { createServer } from "node:http";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { extname, join, normalize, sep } from "node:path";
+import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { extname, isAbsolute, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
-const port = 8082;
-const root = join(fileURLToPath(new URL("..", import.meta.url)), "dist");
-const dataDir = join(fileURLToPath(new URL(".", import.meta.url)), "data");
+const serverDir = fileURLToPath(new URL(".", import.meta.url));
+const repoRoot = join(serverDir, "..");
+
+function loadEnvFile() {
+  const path = join(repoRoot, ".env");
+  if (!existsSync(path)) {
+    return;
+  }
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) {
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || process.env[key] !== undefined) {
+      continue;
+    }
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+loadEnvFile();
+
+function configuredPort() {
+  const raw = process.env.PORT?.trim() || "8082";
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`PORT must be a number from 1 to 65535. Received ${raw}`);
+    process.exit(1);
+  }
+  return port;
+}
+
+function configuredDataDir() {
+  const configured = process.env.DATA_DIR?.trim();
+  if (!configured) {
+    return join(serverDir, "data");
+  }
+  return isAbsolute(configured) ? configured : join(repoRoot, configured);
+}
+
+const ports = [configuredPort()];
+const root = join(repoRoot, "dist");
+const dataDir = configuredDataDir();
 const workspacePath = join(dataDir, "workspace.json");
 const directoryPath = join(dataDir, "directory.json");
 const binaryDir = join(dataDir, "binaries");
 const mediaDir = join(dataDir, "media");
+const starterDir = join(serverDir, "starter");
+const systemClientId = "netcore-workspaces";
+const systemName = "NetcoreWorkspaces";
+const welcomeBody = [
+  "👋 Welcome to NetcoreWorkspace!",
+  "",
+  "Your very own self-hosted space to connect, collaborate, and create.",
+  "",
+  "Chat with your team, share files, and hop on calls, all privately connected through Causeway and powered by NetcoreNetwork.",
+  "",
+  "Feel free to say hello and make yourself at home! 🚀",
+].join("\n");
+const starterDocuments = [
+  {
+    id: "starter-welcome",
+    asset: "welcome-to-workspaces.pdf",
+    name: "Welcome to Workspaces! 🎉",
+    mimeType: "application/pdf",
+    pinned: true,
+  },
+  {
+    id: "starter-causeway-cli",
+    asset: "causeway-cli-setup-guide.mp4",
+    name: "Causeway CLI Setup Guide",
+    mimeType: "video/mp4",
+  },
+  {
+    id: "starter-team-setup",
+    asset: "how-to-setup-team-members.pdf",
+    name: "How to Setup Team Members with Causeway",
+    mimeType: "application/pdf",
+  },
+];
 const clients = new Set();
 
 const workspace = {
+  hostClientId: "",
+  welcomeMessage: "",
   direct: {
     threads: [],
   },
@@ -82,6 +166,28 @@ const calls = new Map();
 
 function findFolder(folderId) {
   return workspace.files.folders.find((folder) => folder.id === folderId);
+}
+
+function folderParentKey(folder) {
+  if (!folder?.parentId || !findFolder(folder.parentId)) {
+    return "";
+  }
+  return folder.parentId;
+}
+
+function nestedFolderIds(rootId) {
+  const ids = new Set([rootId]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const folder of workspace.files.folders) {
+      if (folder.parentId && ids.has(folder.parentId) && !ids.has(folder.id)) {
+        ids.add(folder.id);
+        grew = true;
+      }
+    }
+  }
+  return ids;
 }
 
 function findFile(fileId) {
@@ -261,6 +367,8 @@ function writeWorkspace() {
   writeFileSync(
     workspacePath,
     JSON.stringify({
+      hostClientId: workspace.hostClientId,
+      welcomeMessage: workspace.welcomeMessage,
       rooms: workspace.rooms,
       direct: workspace.direct,
       files: workspace.files,
@@ -269,12 +377,127 @@ function writeWorkspace() {
   );
 }
 
+function formatByteCount(size) {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${Math.max(1, Math.round(size / 1024))} KB`;
+  }
+  const megabytes = size / (1024 * 1024);
+  return `${megabytes >= 10 ? Math.round(megabytes) : megabytes.toFixed(1)} MB`;
+}
+
+function leftoverWorkspaceData() {
+  if (existsSync(directoryPath)) {
+    return true;
+  }
+  if (!existsSync(mediaDir)) {
+    return false;
+  }
+  const starterIds = new Set(starterDocuments.map((item) => item.id));
+  return readdirSync(mediaDir).some((name) => name && !name.endsWith(".partial") && !starterIds.has(name));
+}
+
+function initializeFreshWorkspace() {
+  if (existsSync(workspacePath)) {
+    throw new Error("Refusing to initialize a workspace that already has data");
+  }
+  if (leftoverWorkspaceData()) {
+    console.error(`Refusing to initialize ${dataDir} because it already contains workspace data.`);
+    process.exit(1);
+  }
+  mkdirSync(mediaDir, { recursive: true });
+  mkdirSync(binaryDir, { recursive: true });
+  const sentAt = new Date().toISOString();
+  const files = starterDocuments.map((item) => {
+    const source = join(starterDir, item.asset);
+    if (!existsSync(source)) {
+      console.error(`Missing starter document ${source}`);
+      process.exit(1);
+    }
+    const destination = rawMediaPath(item.id);
+    copyFileSync(source, destination);
+    const size = statSync(destination).size;
+    return {
+      id: item.id,
+      name: item.name,
+      detail: `Uploaded · ${formatByteCount(size)}`,
+      body: "",
+      editable: false,
+      mimeType: item.mimeType,
+      size,
+      clientId: systemClientId,
+      uploadedAt: sentAt,
+      modifiedAt: sentAt,
+      ...(item.pinned ? { pinned: true } : {}),
+    };
+  });
+  workspace.hostClientId = "";
+  workspace.welcomeMessage = "";
+  workspace.direct = { threads: [] };
+  workspace.rooms = {
+    rooms: [
+      {
+        id: "general",
+        name: "General",
+        access: "everyone",
+        memberIds: [],
+        messages: [
+          {
+            id: "welcome-general",
+            author: systemName,
+            authorId: systemClientId,
+            time: new Date(sentAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+            sentAt,
+            body: welcomeBody,
+          },
+        ],
+      },
+      { id: "gtm", name: "GTM", messages: [], access: "everyone", memberIds: [] },
+      { id: "engineering", name: "Engineering", messages: [], access: "everyone", memberIds: [] },
+    ],
+  };
+  workspace.files = {
+    folders: [
+      {
+        id: "getting-started",
+        name: "Getting Started",
+        order: 0,
+        files,
+      },
+    ],
+  };
+  workspace.attachments = [];
+  const tempPath = `${workspacePath}.tmp`;
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    tempPath,
+    JSON.stringify({
+      hostClientId: workspace.hostClientId,
+      welcomeMessage: workspace.welcomeMessage,
+      rooms: workspace.rooms,
+      direct: workspace.direct,
+      files: workspace.files,
+      attachments: workspace.attachments,
+    }),
+  );
+  renameSync(tempPath, workspacePath);
+  console.log(`Initialized a new workspace in ${dataDir}`);
+}
+
 function loadPersisted() {
   if (!existsSync(workspacePath)) {
     return;
   }
   try {
     const saved = JSON.parse(readFileSync(workspacePath, "utf8"));
+    if (typeof saved.hostClientId === "string") {
+      workspace.hostClientId = saved.hostClientId;
+    }
+    if (typeof saved.welcomeMessage === "string") {
+      workspace.welcomeMessage = saved.welcomeMessage;
+    }
     if (saved.rooms?.rooms) {
       workspace.rooms = saved.rooms;
     }
@@ -332,6 +555,35 @@ function publicRoom(room) {
   };
 }
 
+function cleanEmoji(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const emoji = value.trim();
+  if (!emoji || emoji.length > 32 || /[\u0000-\u001f]/.test(emoji)) {
+    return "";
+  }
+  return emoji;
+}
+
+function toggleStoredReaction(message, emoji, actor) {
+  if (!Array.isArray(message.reactions)) {
+    message.reactions = [];
+  }
+  const existing = message.reactions.find((item) => item.emoji === emoji);
+  if (!existing) {
+    message.reactions.push({ emoji, authorIds: [actor] });
+  } else if (existing.authorIds.includes(actor)) {
+    existing.authorIds = existing.authorIds.filter((id) => id !== actor);
+  } else {
+    existing.authorIds.push(actor);
+  }
+  message.reactions = message.reactions.filter((item) => item.authorIds.length > 0);
+  if (message.reactions.length === 0) {
+    delete message.reactions;
+  }
+}
+
 function rememberWorkspace(envelope, actorId = "") {
   const actor = envelope.clientId || actorId || "";
   if (envelope.topic === "rooms" && envelope.type === "message") {
@@ -342,14 +594,16 @@ function rememberWorkspace(envelope, actorId = "") {
       return { kind: "drop" };
     }
     const body = typeof message.body === "string" ? message.body.trim() : "";
-    const shared = acceptedSharedFile(message.file, actor, { kind: "room", roomId: room.id });
-    if (!message.id || (!body && !shared)) {
+    const parentId = typeof message.parentId === "string" ? message.parentId : "";
+    const shared = parentId ? undefined : acceptedSharedFile(message.file, actor, { kind: "room", roomId: room.id });
+    const parent = parentId ? room.messages.find((item) => item.id === parentId && !item.parentId) : null;
+    if (!message.id || (parentId ? !parent || !body : !body && !shared)) {
       return { kind: "drop" };
     }
     const stored = {
       id: message.id,
       author: typeof message.author === "string" ? message.author : "",
-      authorId: typeof message.authorId === "string" ? message.authorId : actor,
+      authorId: parentId ? actorId || actor : typeof message.authorId === "string" ? message.authorId : actor,
       time: typeof message.time === "string" ? message.time : "",
       sentAt: typeof message.sentAt === "string" ? message.sentAt : new Date().toISOString(),
       body,
@@ -358,8 +612,59 @@ function rememberWorkspace(envelope, actorId = "") {
     if (message.format === "markdown") {
       stored.format = "markdown";
     }
+    if (parentId) {
+      stored.parentId = parentId;
+      if (message.inChannel === true) {
+        stored.inChannel = true;
+      }
+    }
     room.messages.push(stored);
     return { kind: "message", room, message: stored };
+  }
+  if (envelope.topic === "rooms" && (envelope.type === "react" || envelope.type === "edit")) {
+    const room = workspace.rooms.rooms.find((item) => item.id === envelope.payload?.roomId);
+    const message = room?.messages.find((item) => item.id === envelope.payload?.messageId);
+    const actor = actorId || envelope.clientId || "";
+    if (!room || !canAccessRoom(room, actor) || !message || !actor) {
+      return { kind: "drop" };
+    }
+    if (envelope.type === "react") {
+      const emoji = cleanEmoji(envelope.payload?.emoji);
+      if (!emoji) {
+        return { kind: "drop" };
+      }
+      toggleStoredReaction(message, emoji, actor);
+      return {
+        kind: "react",
+        room,
+        envelope: {
+          id: `rooms-react-${message.id}-${Date.now()}`,
+          topic: "rooms",
+          type: "react",
+          sentAt: new Date().toISOString(),
+          clientId: actor,
+          payload: { roomId: room.id, messageId: message.id, emoji },
+        },
+      };
+    }
+    const body = typeof envelope.payload?.body === "string" ? envelope.payload.body.trim() : "";
+    if (!body || body.length > 8000 || message.authorId !== actor) {
+      return { kind: "drop" };
+    }
+    message.body = body;
+    message.editedAt = new Date().toISOString();
+    return {
+      kind: "edit",
+      room,
+      envelope: {
+        id: `rooms-edit-${message.id}-${Date.now()}`,
+        topic: "rooms",
+        type: "edit",
+        sentAt: message.editedAt,
+        clientId: actor,
+        payload: { roomId: room.id, messageId: message.id, body, editedAt: message.editedAt },
+      },
+    };
   }
   if (envelope.topic === "rooms" && envelope.type === "create") {
     const room = envelope.payload?.room;
@@ -455,7 +760,15 @@ function rememberWorkspace(envelope, actorId = "") {
     if (!folder?.id || !name || workspace.files.folders.some((item) => item.id === folder.id)) {
       return;
     }
-    workspace.files.folders.push({ id: folder.id, name, files: [] });
+    const parentId = typeof folder.parentId === "string" ? folder.parentId.trim() : "";
+    if (parentId && !findFolder(parentId)) {
+      return;
+    }
+    const stored = { id: folder.id, name, files: [] };
+    if (parentId) {
+      stored.parentId = parentId;
+    }
+    workspace.files.folders.push(stored);
     return;
   }
   if (envelope.topic === "files" && envelope.type === "folder-rename") {
@@ -466,15 +779,57 @@ function rememberWorkspace(envelope, actorId = "") {
     }
     return;
   }
+  if (envelope.topic === "files" && envelope.type === "folder-move") {
+    const folder = findFolder(envelope.payload?.folderId);
+    const parentId = typeof envelope.payload?.parentId === "string" ? envelope.payload.parentId.trim() : "";
+    if (!folder) {
+      return;
+    }
+    if (!parentId) {
+      delete folder.parentId;
+      return;
+    }
+    if (parentId === folder.id || nestedFolderIds(folder.id).has(parentId) || !findFolder(parentId)) {
+      return;
+    }
+    folder.parentId = parentId;
+    return;
+  }
+  if (envelope.topic === "files" && envelope.type === "folder-reorder") {
+    const parentId = typeof envelope.payload?.parentId === "string" ? envelope.payload.parentId.trim() : "";
+    const folderIds = Array.isArray(envelope.payload?.folderIds)
+      ? envelope.payload.folderIds.filter((id) => typeof id === "string" && id)
+      : [];
+    if (new Set(folderIds).size !== folderIds.length) {
+      return;
+    }
+    const siblings = workspace.files.folders.filter((folder) => folderParentKey(folder) === parentId);
+    if (folderIds.length !== siblings.length || folderIds.some((id) => !siblings.some((folder) => folder.id === id))) {
+      return;
+    }
+    for (let index = 0; index < folderIds.length; index += 1) {
+      const folder = findFolder(folderIds[index]);
+      if (folder) {
+        folder.order = index;
+      }
+    }
+    return;
+  }
   if (envelope.topic === "files" && envelope.type === "folder-delete") {
     const folder = findFolder(envelope.payload?.folderId);
     if (!folder) {
       return;
     }
-    for (const file of folder.files) {
-      forgetStoredFile(file.id);
+    const ids = nestedFolderIds(folder.id);
+    for (const item of workspace.files.folders) {
+      if (!ids.has(item.id)) {
+        continue;
+      }
+      for (const file of item.files) {
+        forgetStoredFile(file.id);
+      }
     }
-    workspace.files.folders = workspace.files.folders.filter((item) => item.id !== folder.id);
+    workspace.files.folders = workspace.files.folders.filter((item) => !ids.has(item.id));
     return;
   }
   if (envelope.topic === "files" && envelope.type === "file-rename") {
@@ -482,6 +837,20 @@ function rememberWorkspace(envelope, actorId = "") {
     const name = typeof envelope.payload?.name === "string" ? envelope.payload.name.trim() : "";
     if (file && name) {
       file.name = name;
+      if (typeof envelope.payload?.modifiedAt === "string" && envelope.payload.modifiedAt) {
+        file.modifiedAt = envelope.payload.modifiedAt;
+      }
+    }
+    return;
+  }
+  if (envelope.topic === "files" && envelope.type === "file-pin") {
+    const file = findFile(envelope.payload?.fileId);
+    if (file) {
+      if (envelope.payload?.pinned === true) {
+        file.pinned = true;
+      } else {
+        delete file.pinned;
+      }
     }
     return;
   }
@@ -719,6 +1088,10 @@ function relayRoomResult(result, raw, socket) {
     }
     return;
   }
+  if (result.kind === "react" || result.kind === "edit") {
+    relayToAccess(result.room, JSON.stringify(result.envelope), socket);
+    return;
+  }
   if (result.kind === "members") {
     for (const id of result.gained) {
       sendToPeer(id, roomEvent("create", { room: publicRoom(result.room) }));
@@ -866,8 +1239,9 @@ function cleanDirectMessage(message, actor, other) {
     return null;
   }
   const body = typeof message.body === "string" ? message.body.trim() : "";
-  const shared = acceptedSharedFile(message.file, actor, { kind: "direct", participantIds: [actor, other] });
-  if (!body && !shared) {
+  const parentId = typeof message.parentId === "string" ? message.parentId : "";
+  const shared = parentId ? undefined : acceptedSharedFile(message.file, actor, { kind: "direct", participantIds: [actor, other] });
+  if (parentId ? !body : !body && !shared) {
     return null;
   }
   const stored = {
@@ -882,28 +1256,41 @@ function cleanDirectMessage(message, actor, other) {
   if (message.format === "markdown") {
     stored.format = "markdown";
   }
+  if (parentId) {
+    stored.parentId = parentId;
+    if (message.inChannel === true) {
+      stored.inChannel = true;
+    }
+  }
   return stored;
 }
 
 function rememberDirect(envelope, actorId = "") {
+  const actor = actorId || envelope.clientId || "";
+  if (envelope.type === "react" || envelope.type === "edit") {
+    return mutateDirect(envelope, actor);
+  }
   if (envelope.type !== "message") {
     return { kind: "drop" };
   }
-  const actor = envelope.clientId || actorId || "";
+  const claimed = envelope.clientId || actorId || "";
   const ids = memberIdsFrom(envelope.payload?.participantIds);
-  const other = ids.find((id) => id !== actor);
-  if (!actor || ids.length !== 2 || !ids.includes(actor) || !other || !presence.has(other)) {
+  const other = ids.find((id) => id !== claimed);
+  if (!claimed || ids.length !== 2 || !ids.includes(claimed) || !other || !presence.has(other)) {
     return { kind: "drop" };
   }
-  const message = cleanDirectMessage(envelope.payload?.message, actor, other);
+  const message = cleanDirectMessage(envelope.payload?.message, actorId || claimed, other);
   if (!message) {
     return { kind: "drop" };
   }
-  const id = directThreadId(actor, other);
+  const id = directThreadId(claimed, other);
   let thread = workspace.direct.threads.find((item) => item.id === id);
   if (!thread) {
-    thread = { id, participantIds: [actor, other].sort(), messages: [] };
+    thread = { id, participantIds: [claimed, other].sort(), messages: [] };
     workspace.direct.threads.push(thread);
+  }
+  if (message.parentId && !thread.messages.some((item) => item.id === message.parentId && !item.parentId)) {
+    return { kind: "drop" };
   }
   if (thread.messages.some((item) => item.id === message.id)) {
     return { kind: "drop" };
@@ -912,21 +1299,75 @@ function rememberDirect(envelope, actorId = "") {
   return { kind: "message", thread, message };
 }
 
+function mutateDirect(envelope, actor) {
+  const ids = memberIdsFrom(envelope.payload?.participantIds);
+  if (!actor || ids.length !== 2 || !ids.includes(actor)) {
+    return { kind: "drop" };
+  }
+  const thread = workspace.direct.threads.find((item) => item.id === directThreadId(ids[0], ids[1]));
+  const message = thread?.messages.find((item) => item.id === envelope.payload?.messageId);
+  if (!thread || !message) {
+    return { kind: "drop" };
+  }
+  if (envelope.type === "react") {
+    const emoji = cleanEmoji(envelope.payload?.emoji);
+    if (!emoji) {
+      return { kind: "drop" };
+    }
+    toggleStoredReaction(message, emoji, actor);
+    return {
+      kind: "react",
+      thread,
+      envelope: {
+        id: `direct-react-${message.id}-${Date.now()}`,
+        topic: "direct",
+        type: "react",
+        sentAt: new Date().toISOString(),
+        clientId: actor,
+        payload: { participantIds: thread.participantIds, messageId: message.id, emoji },
+      },
+    };
+  }
+  const body = typeof envelope.payload?.body === "string" ? envelope.payload.body.trim() : "";
+  if (!body || body.length > 8000 || message.authorId !== actor) {
+    return { kind: "drop" };
+  }
+  message.body = body;
+  message.editedAt = new Date().toISOString();
+  return {
+    kind: "edit",
+    thread,
+    envelope: {
+      id: `direct-edit-${message.id}-${Date.now()}`,
+      topic: "direct",
+      type: "edit",
+      sentAt: message.editedAt,
+      clientId: actor,
+      payload: { participantIds: thread.participantIds, messageId: message.id, body, editedAt: message.editedAt },
+    },
+  };
+}
+
 function relayDirect(result, sender) {
-  if (!result || result.kind !== "message") {
+  if (!result || result.kind === "drop") {
     return;
   }
-  const data = JSON.stringify({
-    id: result.message.id,
-    topic: "direct",
-    type: "message",
-    sentAt: result.message.sentAt,
-    payload: {
-      threadId: result.thread.id,
-      participantIds: result.thread.participantIds,
-      message: result.message,
-    },
-  });
+  const data = JSON.stringify(
+    result.kind === "message"
+      ? {
+          id: result.message.id,
+          topic: "direct",
+          type: "message",
+          sentAt: result.message.sentAt,
+          clientId: result.message.authorId,
+          payload: {
+            threadId: result.thread.id,
+            participantIds: result.thread.participantIds,
+            message: result.message,
+          },
+        }
+      : result.envelope,
+  );
   for (const client of clients) {
     if (client === sender || client.readyState !== 1) {
       continue;
@@ -942,6 +1383,8 @@ function visibleFiles(clientId) {
     folders: workspace.files.folders.map((folder) => ({
       id: folder.id,
       name: folder.name,
+      ...(folder.parentId ? { parentId: folder.parentId } : {}),
+      ...(typeof folder.order === "number" ? { order: folder.order } : {}),
       files: folder.files.filter((file) => canSeeStoredFile(file, clientId)),
     })),
   };
@@ -965,6 +1408,7 @@ function snapshotMessage(clientId) {
       rooms: { rooms },
       direct: { threads },
       files: visibleFiles(clientId),
+      hostClientId: workspace.hostClientId || "",
       calls: [...calls.entries()]
         .filter(([roomId]) => canAccessRoom(workspace.rooms.rooms.find((item) => item.id === roomId), clientId))
         .map(([roomId]) => callStatusPayload(roomId)),
@@ -1220,6 +1664,7 @@ async function serveMedia(request, response) {
 
 function handler(request, response) {
   const url = request.url ?? "/";
+  console.log(`${request.method || "GET"} ${url.split("?")[0]}`);
   if (url.startsWith("/ws")) {
     response.writeHead(426);
     response.end();
@@ -1256,6 +1701,10 @@ function clientIdFromRequest(request) {
   }
 }
 
+function publicClientId(id) {
+  return id && id !== systemClientId ? id : "";
+}
+
 function presenceMessage() {
   return JSON.stringify({
     id: `presence-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1286,25 +1735,236 @@ function scheduleDirectory() {
 function writeDirectory() {
   const people = [...presence.values()]
     .filter((peer) => peer.displayName)
-    .map((peer) => ({ clientId: peer.clientId, displayName: peer.displayName }));
+    .map((peer) => {
+      const person = { clientId: peer.clientId, displayName: peer.displayName };
+      if (peer.title) {
+        person.title = peer.title;
+      }
+      if (peer.location) {
+        person.location = peer.location;
+      }
+      if (peer.photoUri) {
+        person.photoUri = peer.photoUri;
+      }
+      return person;
+    });
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(directoryPath, JSON.stringify({ people }));
 }
 
-function upsertPeer(clientId, displayName, online, refreshConnectedAt) {
+function profileText(value, previous = "") {
+  if (typeof value !== "string") {
+    return previous;
+  }
+  return value.trim().replace(/\s+/g, " ").slice(0, 80);
+}
+
+function profilePhoto(value, previous = "") {
+  if (typeof value !== "string") {
+    return previous;
+  }
+  if (!value) {
+    return "";
+  }
+  if (!/^data:image\/(jpeg|png|webp);base64,/.test(value) || value.length > 100000) {
+    return previous;
+  }
+  return value;
+}
+
+function isLoopback(address) {
+  const host = String(address || "").replace(/^::ffff:/, "");
+  return host === "127.0.0.1" || host === "::1";
+}
+
+function inferHost() {
+  if (workspace.hostClientId) {
+    return;
+  }
+  const counts = new Map();
+  for (const folder of workspace.files?.folders || []) {
+    for (const file of folder.files || []) {
+      if (typeof file.clientId === "string" && file.clientId && file.clientId !== systemClientId) {
+        counts.set(file.clientId, (counts.get(file.clientId) || 0) + 1);
+      }
+    }
+  }
+  let hostId = "";
+  let most = 0;
+  for (const [id, count] of counts) {
+    if (count > most) {
+      hostId = id;
+      most = count;
+    }
+  }
+  if (!hostId) {
+    const named = [...presence.values()].filter((peer) => peer.displayName && peer.clientId !== systemClientId);
+    if (named.length === 1) {
+      hostId = named[0].clientId;
+    }
+  }
+  if (!hostId) {
+    return;
+  }
+  workspace.hostClientId = hostId;
+  scheduleSave();
+}
+
+function claimHost(clientId) {
+  if (!clientId || workspace.hostClientId) {
+    return;
+  }
+  workspace.hostClientId = clientId;
+  scheduleSave();
+}
+
+function liftWelcomeMessage() {
+  const room = workspace.rooms.rooms.find((item) => item.id === "general");
+  if (!room || !Array.isArray(room.messages)) {
+    return;
+  }
+  const index = room.messages.findIndex(
+    (message) =>
+      message?.authorId !== systemClientId &&
+      typeof message?.body === "string" &&
+      message.body.includes("Welcome to NetcoreWorkspace"),
+  );
+  if (index < 0) {
+    return;
+  }
+  if (!workspace.welcomeMessage) {
+    workspace.welcomeMessage = room.messages[index].body;
+  }
+  room.messages.splice(index, 1);
+  scheduleSave();
+}
+
+function welcomeMessageFor(guestId) {
+  const body = typeof workspace.welcomeMessage === "string" ? workspace.welcomeMessage.trim() : "";
+  const hostId = workspace.hostClientId;
+  if (!body || !hostId || !guestId) {
+    return null;
+  }
+  return {
+    id: `welcome-${guestId}`,
+    author: presence.get(hostId)?.displayName || "Ankita",
+    authorId: hostId,
+    time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+    sentAt: new Date().toISOString(),
+    body,
+  };
+}
+
+function ensureHostDirect(clientId) {
+  const hostId = workspace.hostClientId;
+  if (!hostId || !clientId || clientId === hostId) {
+    return null;
+  }
+  const id = directThreadId(hostId, clientId);
+  let thread = workspace.direct.threads.find((item) => item.id === id);
+  let welcome = null;
+  if (!thread) {
+    welcome = welcomeMessageFor(clientId);
+    thread = { id, participantIds: [hostId, clientId].sort(), messages: welcome ? [welcome] : [] };
+    workspace.direct.threads.push(thread);
+    scheduleSave();
+  }
+  return { thread, welcome };
+}
+
+function announceDirectMessage(thread, message) {
+  if (!thread || !message) {
+    return;
+  }
+  const data = JSON.stringify({
+    id: message.id,
+    topic: "direct",
+    type: "message",
+    sentAt: message.sentAt,
+    clientId: message.authorId,
+    payload: {
+      threadId: thread.id,
+      participantIds: thread.participantIds,
+      message,
+    },
+  });
+  for (const client of clients) {
+    if (client.readyState === 1 && thread.participantIds.includes(client.clientId)) {
+      client.send(data);
+    }
+  }
+}
+
+function announceHostDirect(thread) {
+  if (!thread) {
+    return;
+  }
+  const data = JSON.stringify({
+    id: `direct-open-${thread.id}-${Date.now()}`,
+    topic: "direct",
+    type: "open",
+    sentAt: new Date().toISOString(),
+    clientId: workspace.hostClientId,
+    payload: { participantIds: thread.participantIds },
+  });
+  for (const client of clients) {
+    if (client.readyState === 1 && thread.participantIds.includes(client.clientId)) {
+      client.send(data);
+    }
+  }
+}
+
+function grantGeneralAccess(clientId) {
+  if (!clientId) {
+    return false;
+  }
+  const room = workspace.rooms.rooms.find((item) => item.id === "general");
+  if (!room) {
+    return false;
+  }
+  const memberIds = memberIdsFrom(room.memberIds);
+  if (memberIds.includes(clientId)) {
+    return false;
+  }
+  memberIds.push(clientId);
+  room.access = "selected";
+  room.memberIds = memberIds;
+  scheduleSave();
+  return true;
+}
+
+function announceGeneralJoin(clientId) {
+  const room = workspace.rooms.rooms.find((item) => item.id === "general");
+  if (!room) {
+    return;
+  }
+  sendToPeer(clientId, roomEvent("create", { room: publicRoom(room) }));
+  relayToAccess(room, roomEvent("members", { roomId: room.id, memberIds: room.memberIds }), null);
+}
+
+function upsertPeer(clientId, displayName, online, refreshConnectedAt, extras) {
   if (!clientId) {
     return;
   }
   const current = presence.get(clientId);
   const previousName = current?.displayName || "";
   const nextName = typeof displayName === "string" && displayName.trim() ? displayName.trim() : previousName;
+  const has = (key) => extras && Object.prototype.hasOwnProperty.call(extras, key);
+  const title = has("title") ? profileText(extras.title, "") : current?.title || "";
+  const location = has("location") ? profileText(extras.location, "") : current?.location || "";
+  const photoUri = has("photoUri") ? profilePhoto(extras.photoUri, "") : current?.photoUri || "";
   presence.set(clientId, {
     clientId,
     displayName: nextName,
+    title,
+    location,
+    photoUri,
     status: online ? "online" : "offline",
     connectedAt: refreshConnectedAt || !current ? new Date().toISOString() : current.connectedAt,
   });
-  if (nextName && nextName !== previousName) {
+  const changed =
+    nextName !== previousName || title !== (current?.title || "") || location !== (current?.location || "") || photoUri !== (current?.photoUri || "");
+  if (nextName && changed) {
     scheduleDirectory();
   }
 }
@@ -1317,7 +1977,11 @@ function loadDirectory() {
     const saved = JSON.parse(readFileSync(directoryPath, "utf8"));
     for (const person of saved.people || []) {
       if (typeof person?.clientId === "string" && typeof person?.displayName === "string") {
-        upsertPeer(person.clientId, person.displayName, false, false);
+        upsertPeer(person.clientId, person.displayName, false, false, {
+          title: person.title,
+          location: person.location,
+          photoUri: person.photoUri,
+        });
       }
     }
   } catch (error) {
@@ -1326,6 +1990,9 @@ function loadDirectory() {
 }
 
 function rememberAuthor(authorId, author) {
+  if (authorId === systemClientId) {
+    return;
+  }
   if (typeof authorId !== "string" || !authorId || typeof author !== "string" || !author.trim()) {
     return;
   }
@@ -1427,8 +2094,14 @@ function relayOrganize(result) {
 function attachRelay(server) {
   const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 * 1024 });
   wss.on("connection", (socket, request) => {
-    const clientId = clientIdFromRequest(request);
+    const clientId = publicClientId(clientIdFromRequest(request));
     socket.clientId = clientId;
+    socket.loopback = isLoopback(request.socket?.remoteAddress);
+    if (socket.loopback) {
+      claimHost(clientId);
+    }
+    const joinedGeneral = clientId ? grantGeneralAccess(clientId) : false;
+    const hostDirect = clientId ? ensureHostDirect(clientId) : null;
     if (clientId) {
       upsertPeer(clientId, "", true, true);
     }
@@ -1437,14 +2110,41 @@ function attachRelay(server) {
     if (clientId) {
       broadcastPresence();
     }
+    if (joinedGeneral) {
+      announceGeneralJoin(clientId);
+    }
+    if (hostDirect) {
+      announceHostDirect(hostDirect.thread);
+      if (hostDirect.welcome) {
+        announceDirectMessage(hostDirect.thread, hostDirect.welcome);
+      }
+    }
     socket.on("message", (data, isBinary) => {
       if (!isBinary) {
         try {
           const envelope = JSON.parse(data.toString());
           if (envelope?.topic === "presence" && envelope?.type === "hello") {
-            const id = envelope.clientId || envelope.payload?.clientId || socket.clientId;
+            const id = publicClientId(envelope.clientId || envelope.payload?.clientId || socket.clientId);
             socket.clientId = id || socket.clientId;
-            upsertPeer(id, envelope.payload?.displayName || "", true, false);
+            if (socket.loopback) {
+              claimHost(socket.clientId);
+            }
+            upsertPeer(id, envelope.payload?.displayName || "", true, false, {
+              title: envelope.payload?.title,
+              location: envelope.payload?.location,
+              photoUri: envelope.payload?.photoUri,
+            });
+            const joinedGeneral = grantGeneralAccess(id);
+            const hostDirect = ensureHostDirect(id);
+            if (joinedGeneral) {
+              announceGeneralJoin(id);
+            }
+            if (hostDirect) {
+              announceHostDirect(hostDirect.thread);
+              if (hostDirect.welcome) {
+                announceDirectMessage(hostDirect.thread, hostDirect.welcome);
+              }
+            }
             broadcastPresence();
             return;
           }
@@ -1470,7 +2170,7 @@ function attachRelay(server) {
           if (envelope?.topic === "direct") {
             const result = rememberDirect(envelope, socket.clientId || "");
             relayDirect(result, socket);
-            if (result?.kind === "message") {
+            if (result?.kind && result.kind !== "drop") {
               scheduleSave();
             }
             return;
@@ -1509,7 +2209,7 @@ function attachRelay(server) {
   });
 }
 
-function listen(host) {
+function listen(host, port) {
   const server = createServer(handler);
   attachRelay(server);
   return new Promise((resolve, reject) => {
@@ -1525,23 +2225,31 @@ if (!existsSync(join(root, "index.html"))) {
   process.exit(1);
 }
 
-loadPersisted();
-loadDirectory();
-seedNamesFromHistory();
+if (existsSync(workspacePath)) {
+  loadPersisted();
+  loadDirectory();
+  seedNamesFromHistory();
+  inferHost();
+  liftWelcomeMessage();
+} else {
+  initializeFreshWorkspace();
+}
 
 const servers = [];
-try {
-  servers.push(await listen("127.0.0.1"));
-} catch (error) {
-  console.error("Could not listen on 127.0.0.1:8082");
-  console.error(error);
-  process.exit(1);
-}
-try {
-  servers.push(await listen("::1"));
-} catch (error) {
-  console.error("Could not listen on [::1]:8082");
-  console.error(error);
+for (const port of ports) {
+  try {
+    servers.push(await listen("0.0.0.0", port));
+  } catch (error) {
+    console.error(`Could not listen on 0.0.0.0:${port}`);
+    console.error(error);
+    process.exit(1);
+  }
+  try {
+    servers.push(await listen("::1", port));
+  } catch (error) {
+    console.error(`Could not listen on [::1]:${port}`);
+    console.error(error);
+  }
 }
 
 setInterval(() => {
@@ -1553,5 +2261,7 @@ setInterval(() => {
 }, 20000).unref();
 
 console.log("Netcore Workspace");
-console.log("http://127.0.0.1:8082");
-console.log("ws://127.0.0.1:8082/ws");
+console.log(`Data ${dataDir}`);
+for (const port of ports) {
+  console.log(`http://127.0.0.1:${port}`);
+}

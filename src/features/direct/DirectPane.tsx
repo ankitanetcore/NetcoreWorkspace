@@ -1,25 +1,29 @@
 import * as DocumentPicker from "expo-document-picker";
 import { useEffect, useRef, useState } from "react";
-import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
+import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 
 import { BackButton } from "@/components/BackButton";
-import { UploadIcon } from "@/components/UploadIcon";
+import { ProfileAvatar } from "@/components/ProfileAvatar";
+import { ArrowUpIcon, PaperclipIcon, SmileIcon } from "@/components/ChatIcons";
 import type { FileAudience, RoomMessage, SharedFileRef } from "@/domain/types";
 import { sendDirectMessage, threadForPeer } from "@/features/direct/direct";
 import { assetFromFile } from "@/features/files/desktopFile";
 import { FileDropSurface } from "@/features/files/FileDropSurface";
-import { SharedFileCard } from "@/features/files/SharedFileCard";
 import { transferChatFile } from "@/features/files/transferBytes";
 import { subscribeTransferNotice } from "@/features/files/transferNotice";
-import { columnTextStyle } from "@/features/messages/columnText";
 import { EmojiPicker } from "@/features/messages/EmojiPicker";
-import { continuesSender } from "@/features/messages/preview";
+import { DayDivider } from "@/features/messages/DayDivider";
+import { ChatMessage } from "@/features/messages/ChatMessage";
+import { editInDirect, reactInDirect, replyInDirect } from "@/features/messages/messageActions";
+import { channelMessages, continuesSender, repliesTo } from "@/features/messages/preview";
+import { sentDay } from "@/features/messages/sentWhen";
+import { ThreadPanel } from "@/features/messages/ThreadPanel";
 import { markRead } from "@/features/messages/readState";
 import { useKnownPeers } from "@/features/rooms/RoomDialogs";
 import { displayNameFor } from "@/session/displayName";
 import { useSession } from "@/session/Session";
 import { webPointer } from "@/theme/pressable";
-import { colors, font, text } from "@/theme/tokens";
+import { colors, font, layout, text } from "@/theme/tokens";
 import { getTransport } from "@/transport";
 
 export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => void }) {
@@ -35,6 +39,16 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
   const stickToEnd = useRef(true);
   const [dropped, setDropped] = useState<DocumentPicker.DocumentPickerAsset | null>(null);
   const [droppedExtra, setDroppedExtra] = useState(0);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const { width } = useWindowDimensions();
+  const timeline = channelMessages(messages);
+  const threadRoot = messages.find((message) => message.id === threadId && !message.parentId);
+
+  useEffect(() => {
+    setThreadId(null);
+    setDropped(null);
+    setDroppedExtra(0);
+  }, [peerId]);
 
   useEffect(() => {
     return getTransport().subscribe("direct", () => {
@@ -66,7 +80,7 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
     <View style={styles.thread}>
       <View style={styles.header}>
         {onBack ? <BackButton onPress={onBack} /> : null}
-        <View style={[styles.dot, online ? styles.dotOnline : styles.dotOffline]} />
+        <ProfileAvatar name={label} photoUri={peer?.photoUri} size={36} backgroundColor={colors.burgundySoft} color={colors.burgundy} />
         <View style={styles.title}>
           <Text accessibilityRole="header" style={[text.title, font.brand, styles.brandTitle]} numberOfLines={1}>
             {label}
@@ -74,6 +88,7 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
           <Text style={[text.meta, font.content]}>{online ? "Connected" : "Not connected"}</Text>
         </View>
       </View>
+      <View style={styles.conversation}>
       <FileDropSurface
         label={`Drop a file to attach it for ${label}. You still press Send.`}
         onFiles={(files) => {
@@ -85,7 +100,7 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
           setDroppedExtra(rest.length);
         }}
       >
-      {messages.length === 0 ? (
+      {timeline.length === 0 ? (
         <View style={styles.empty}>
           <Text style={[text.meta, font.content]}>No messages yet</Text>
           <Text style={styles.note}>Only you and {label} can see this conversation.</Text>
@@ -105,18 +120,31 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
             }
           }}
         >
-          {messages.map((message, index) => (
-            <DirectMessage
-              key={message.id}
-              message={message}
-              mine={message.authorId === clientId}
-              grouped={continuesSender(messages[index - 1], message)}
-              author={displayNameFor(peers, message.authorId, message.author, { clientId, name })}
-            />
-          ))}
+          {timeline.map((message, index) => {
+            const day = sentDay(message.sentAt);
+            const previous = timeline[index - 1];
+            const previousDay = sentDay(previous?.sentAt);
+            return (
+              <View key={message.id} style={styles.messageBlock}>
+                {day && day !== previousDay ? <DayDivider label={day} /> : null}
+                <ChatMessage
+                  message={message}
+                  mine={message.authorId === clientId}
+                  grouped={continuesSender(previous, message)}
+                  author={displayNameFor(peers, message.authorId, message.author, { clientId, name })}
+                  replyCount={message.parentId ? 0 : repliesTo(messages, message.id).length}
+                  linked={Boolean(message.parentId)}
+                  onReact={(emoji) => reactInDirect(peerId, message.id, emoji)}
+                  onEdit={(body) => editInDirect(peerId, message, body)}
+                  onReply={() => setThreadId(message.parentId || message.id)}
+                />
+              </View>
+            );
+          })}
         </ScrollView>
       )}
       <Composer
+        conversationName={label}
         audience={{ kind: "direct", participantIds: [clientId, peerId].filter(Boolean) }}
         onSend={send}
         dropped={dropped}
@@ -127,36 +155,21 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
         }}
       />
       </FileDropSurface>
-    </View>
-  );
-}
-
-function DirectMessage({
-  message,
-  mine,
-  grouped,
-  author,
-}: {
-  message: RoomMessage;
-  mine: boolean;
-  grouped: boolean;
-  author: string;
-}) {
-  const attachmentOnly = Boolean(message.file) && !message.body?.trim();
-  return (
-    <View style={[styles.message, mine && styles.messageMine, grouped && styles.messageGrouped]}>
-      {grouped ? null : (
-        <View style={styles.meta}>
-          <Text style={styles.author}>{author}</Text>
-          <Text style={styles.time}>{message.time}</Text>
-        </View>
-      )}
-      {message.body?.trim() ? (
-        <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubbleOther]}>
-          <Text style={[styles.messageBody, columnTextStyle(message.body)]}>{message.body}</Text>
-        </View>
+      {threadRoot ? (
+        <ThreadPanel
+          messages={messages}
+          parentId={threadRoot.id}
+          audience="direct"
+          overlay={width < layout.desktopMinWidth}
+          authorFor={(message) => displayNameFor(peers, message.authorId, message.author, { clientId, name })}
+          mineFor={(message) => message.authorId === clientId}
+          onReact={(messageId, emoji) => reactInDirect(peerId, messageId, emoji)}
+          onEdit={(message, body) => editInDirect(peerId, message, body)}
+          onReply={(body, inChannel) => replyInDirect(peerId, threadRoot.id, body, name, inChannel)}
+          onClose={() => setThreadId(null)}
+        />
       ) : null}
-      {message.file ? <SharedFileCard file={message.file} solo={attachmentOnly} suggest={mine} /> : null}
+      </View>
     </View>
   );
 }
@@ -172,7 +185,10 @@ function outgoingId(kind: "file" | "text") {
   return `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const singleLineHeight = 52;
+const inputLineHeight = 22;
+const inputPad = 9;
+const singleLineHeight = inputLineHeight + inputPad * 2;
+const maxInputHeight = inputLineHeight * 5 + inputPad * 2;
 
 function useComposerFrame(fieldRef: { current: View | null }) {
   useEffect(() => {
@@ -209,12 +225,14 @@ function useComposerFrame(fieldRef: { current: View | null }) {
 }
 
 export function Composer({
+  conversationName,
   audience,
   onSend,
   dropped = null,
   droppedExtra = 0,
   onDropped,
 }: {
+  conversationName: string;
   audience: FileAudience;
   onSend: (message: OutgoingMessage) => void;
   dropped?: DocumentPicker.DocumentPickerAsset | null;
@@ -246,13 +264,17 @@ export function Composer({
     });
   }
 
-  function resizeInput() {
+  function resizeInput(contentHeight?: number) {
     const node = inputRef.current as unknown as HTMLTextAreaElement | null;
     if (!node || Platform.OS !== "web") {
+      if (typeof contentHeight === "number") {
+        const next = Math.max(singleLineHeight, Math.min(maxInputHeight, contentHeight));
+        setInputHeight((current) => (current === next ? current : next));
+      }
       return;
     }
     node.style.height = `${singleLineHeight}px`;
-    const next = Math.max(singleLineHeight, Math.min(120, node.scrollHeight));
+    const next = Math.max(singleLineHeight, Math.min(maxInputHeight, node.scrollHeight));
     setInputHeight((current) => (current === next ? current : next));
   }
   const onDroppedRef = useRef(onDropped);
@@ -277,6 +299,44 @@ export function Composer({
     fileSent?: boolean;
     textSent?: boolean;
   }>({});
+
+  useEffect(() => {
+    if (Platform.OS !== "web") {
+      return;
+    }
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (!node) {
+      return;
+    }
+    const onPaste = (event: ClipboardEvent) => {
+      const fromItems = [...(event.clipboardData?.items ?? [])]
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => Boolean(file));
+      const fromFiles = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+      const images = fromItems.length > 0 ? fromItems : fromFiles;
+      if (images.length === 0) {
+        return;
+      }
+      event.preventDefault();
+      const file = images[0];
+      const extension = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+      const name = file.name && !/^image\./i.test(file.name) ? file.name : `Pasted image.${extension}`;
+      attempt.current = {};
+      setPending({
+        name,
+        mimeType: file.type || "image/png",
+        size: file.size,
+        uri: URL.createObjectURL(file),
+        lastModified: file.lastModified,
+        file,
+      });
+      setNotice(images.length > 1 ? "Attached the first image. Send it, then paste the next." : "");
+    };
+    node.addEventListener("paste", onPaste);
+    return () => node.removeEventListener("paste", onPaste);
+  }, []);
+
   const body = draft.trim();
   const ready = Boolean(body || pending) && !sending;
 
@@ -345,6 +405,7 @@ export function Composer({
           current.textSent = true;
         }
         setDraft("");
+        setInputHeight(singleLineHeight);
         setEmojiOpen(false);
       }
       clearAttempt();
@@ -360,6 +421,7 @@ export function Composer({
     <View style={[styles.composer, emojiOpen && styles.composerOpen]}>
       {pending ? (
         <View style={styles.pending}>
+          <PaperclipIcon size={14} color={colors.muted} />
           <Text style={styles.pendingName} numberOfLines={1}>
             {pending.name}
           </Text>
@@ -389,53 +451,54 @@ export function Composer({
           }}
         />
       ) : null}
-      <View ref={fieldRef} style={styles.field}>
+      <View style={styles.composerRow}>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Attach a file"
           onPress={() => void attach()}
-          style={({ pressed }) => [styles.attach, webPointer, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.iconButton, webPointer, pressed && styles.pressed]}
         >
-          <UploadIcon />
+          <PaperclipIcon size={18} color={colors.muted} />
         </Pressable>
-        <View style={styles.attachDivider} />
-        <View ref={emojiButtonRef} collapsable={false}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Add emoji"
-          accessibilityState={{ expanded: emojiOpen }}
-          onPress={() => setEmojiOpen((open) => !open)}
-          style={({ pressed, hovered }) => [
-            styles.mode,
-            (emojiOpen || hovered) && styles.modeOn,
-            webPointer,
-            pressed && styles.pressed,
-          ]}
-        >
-          <Text style={styles.modeGlyph}>☺</Text>
-        </Pressable>
+        <View ref={fieldRef} style={styles.field}>
+          <TextInput
+            ref={inputRef}
+            value={draft}
+            onChangeText={(value) => {
+              setDraft(value);
+              if (!value) {
+                setInputHeight(singleLineHeight);
+              }
+              requestAnimationFrame(resizeInput);
+            }}
+            multiline
+            numberOfLines={1}
+            blurOnSubmit={false}
+            placeholder={`Message ${conversationName}...`}
+            placeholderTextColor={colors.faint}
+            accessibilityLabel={`Message ${conversationName}`}
+            onContentSizeChange={(event) => requestAnimationFrame(() => resizeInput(event.nativeEvent.contentSize.height))}
+            onKeyPress={(event) => {
+              const native = event.nativeEvent as { key?: string; shiftKey?: boolean };
+              if (native.key === "Enter" && !native.shiftKey) {
+                event.preventDefault();
+                void send();
+              }
+            }}
+            style={[styles.input, { height: inputHeight }]}
+          />
+          <View ref={emojiButtonRef} collapsable={false}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Add emoji"
+              accessibilityState={{ expanded: emojiOpen }}
+              onPress={() => setEmojiOpen((open) => !open)}
+              style={({ pressed }) => [styles.emojiButton, webPointer, pressed && styles.pressed]}
+            >
+              <SmileIcon size={18} color={emojiOpen ? colors.burgundy : colors.muted} />
+            </Pressable>
+          </View>
         </View>
-        <TextInput
-          ref={inputRef}
-          value={draft}
-          onChangeText={(value) => {
-            setDraft(value);
-            requestAnimationFrame(resizeInput);
-          }}
-          multiline
-          numberOfLines={1}
-          blurOnSubmit={false}
-          accessibilityLabel="Message"
-          onContentSizeChange={() => requestAnimationFrame(resizeInput)}
-          onKeyPress={(event) => {
-            const native = event.nativeEvent as { key?: string; shiftKey?: boolean };
-            if (native.key === "Enter" && !native.shiftKey) {
-              event.preventDefault();
-              void send();
-            }
-          }}
-          style={[styles.input, { height: inputHeight }]}
-        />
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send"
@@ -443,7 +506,7 @@ export function Composer({
           onPress={() => void send()}
           style={({ pressed }) => [styles.send, !ready && styles.sendDisabled, webPointer, pressed && ready ? styles.pressed : null]}
         >
-          <Text style={styles.sendLabel}>Send</Text>
+          <ArrowUpIcon size={16} color={colors.youText} />
         </Pressable>
       </View>
       </View>
@@ -457,6 +520,13 @@ const styles = StyleSheet.create({
     minWidth: 0,
     minHeight: 0,
     backgroundColor: colors.background,
+  },
+  conversation: {
+    flex: 1,
+    minHeight: 0,
+    minWidth: 0,
+    flexDirection: "row",
+    position: "relative",
   },
   header: {
     height: 72,
@@ -506,6 +576,10 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 16,
     gap: 18,
+  },
+  messageBlock: {
+    alignSelf: "stretch",
+    gap: 8,
   },
   message: {
     alignSelf: "flex-start",
@@ -572,11 +646,19 @@ const styles = StyleSheet.create({
     zIndex: 5,
   },
   pending: {
+    alignSelf: "flex-start",
+    maxWidth: "100%",
     minHeight: 28,
     marginBottom: 8,
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
   },
   pendingName: {
     ...font.content,
@@ -606,79 +688,64 @@ const styles = StyleSheet.create({
     position: "relative",
     zIndex: 2,
   },
+  composerRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+  },
+  iconButton: {
+    width: 36,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   field: {
-    minHeight: 54,
-    maxHeight: 140,
+    flex: 1,
+    minWidth: 0,
+    minHeight: singleLineHeight,
+    maxHeight: maxInputHeight,
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: 12,
     backgroundColor: colors.surface,
-    paddingLeft: 4,
-    paddingRight: 8,
+    paddingLeft: 12,
+    paddingRight: 4,
   },
-  attach: {
+  emojiButton: {
     width: 32,
     height: 32,
     alignItems: "center",
     justifyContent: "center",
   },
-  attachDivider: {
-    width: 1,
-    alignSelf: "stretch",
-    marginVertical: 10,
-    backgroundColor: colors.line,
-  },
-  mode: {
-    width: 28,
-    height: 28,
-    marginLeft: 2,
-    borderRadius: 8,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  modeOn: {
-    backgroundColor: colors.burgundySoft,
-  },
-  modeGlyph: {
-    color: colors.burgundy,
-    fontSize: 16,
-    lineHeight: 18,
-  },
   input: {
     ...font.content,
     flex: 1,
     minWidth: 0,
-    maxHeight: 120,
+    maxHeight: maxInputHeight,
     marginVertical: 0,
-    paddingTop: 15,
-    paddingBottom: 15,
-    paddingHorizontal: 8,
+    paddingTop: inputPad,
+    paddingBottom: inputPad,
+    paddingRight: 4,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: inputLineHeight,
     fontWeight: "400",
     color: colors.ink,
     backgroundColor: "transparent",
     borderWidth: 0,
   },
   send: {
-    height: 32,
-    paddingHorizontal: 8,
-    borderRadius: 8,
+    width: 36,
+    height: 36,
+    marginBottom: 2,
+    borderRadius: 18,
     backgroundColor: colors.burgundy,
     alignItems: "center",
     justifyContent: "center",
   },
   sendDisabled: {
     opacity: 0.4,
-  },
-  sendLabel: {
-    ...font.ui,
-    color: colors.youText,
-    fontSize: 13,
-    lineHeight: 16,
-    fontWeight: "600",
   },
   pressed: {
     opacity: 0.72,

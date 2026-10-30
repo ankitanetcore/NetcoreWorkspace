@@ -2,6 +2,7 @@ import { StyleSheet, View } from "react-native";
 
 export type IconName =
   | "rooms"
+  | "chat"
   | "files"
   | "call"
   | "general"
@@ -67,6 +68,8 @@ function renderShape(name: IconName, color: string, size: number) {
           }}
         />
       );
+    case "chat":
+      return <ChatBubble color={color} size={size} />;
     case "files":
     case "folder":
       return <FolderShape color={color} size={size} />;
@@ -149,6 +152,45 @@ function Triangle({ color, size }: { color: string; size: number }) {
         borderBottomColor: color,
       }}
     />
+  );
+}
+
+function ChatBubble({ color, size }: { color: string; size: number }) {
+  const stroke = 1.75;
+  const width = size * 0.86;
+  const height = size * 0.62;
+  const left = (size - width) / 2;
+  const top = size * 0.06;
+  return (
+    <View style={{ width: size, height: size }}>
+      <View
+        style={{
+          position: "absolute",
+          left,
+          top,
+          width,
+          height,
+          borderRadius: size * 0.28,
+          borderWidth: stroke,
+          borderColor: color,
+        }}
+      />
+      <View
+        style={{
+          position: "absolute",
+          left: left + size * 0.14,
+          top: top + height - stroke,
+          width: 0,
+          height: 0,
+          borderLeftWidth: size * 0.05,
+          borderRightWidth: size * 0.18,
+          borderTopWidth: size * 0.2,
+          borderLeftColor: "transparent",
+          borderRightColor: "transparent",
+          borderTopColor: color,
+        }}
+      />
+    </View>
   );
 }
 

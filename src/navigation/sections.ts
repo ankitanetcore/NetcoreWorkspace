@@ -9,7 +9,7 @@ export interface Section {
 }
 
 export const sections: readonly Section[] = [
-  { href: "/rooms", label: "Chat", icon: "rooms" },
+  { href: "/rooms", label: "Chat", icon: "chat" },
   { href: "/files", label: "Files", icon: "files" },
   { href: "/people", label: "People", icon: "people" },
 ];
