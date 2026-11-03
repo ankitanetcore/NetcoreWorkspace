@@ -107,7 +107,7 @@ const welcomeBody = [
   "",
   "Your very own self-hosted space to connect, collaborate, and create.",
   "",
-  "Chat with your team, share files, and hop on calls, all privately connected through Causeway and powered by NetcoreNetwork.",
+  "Chat with your team, share files, and hop on calls. This workspace runs on your own server, and Causeway can connect your team to it.",
   "",
   "Feel free to say hello and make yourself at home! 🚀",
 ].join("\n");
@@ -474,6 +474,25 @@ function readCookie(request, name) {
   return "";
 }
 
+function sessionCookieHeader(request, secret) {
+  const forwarded = String(request.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const secure = forwarded === "https" || request.socket?.encrypted === true;
+  const parts = [
+    `${sessionCookie}=${secret}`,
+    "HttpOnly",
+    "SameSite=Strict",
+    "Path=/",
+    "Max-Age=31536000",
+  ];
+  if (secure) {
+    parts.push("Secure");
+  }
+  return parts.join("; ");
+}
+
 function sessionClientId(request) {
   const secret = readCookie(request, sessionCookie);
   return validSecret(secret) ? deviceSecrets.get(secret) || "" : "";
@@ -488,9 +507,21 @@ function hostnameOf(hostHeader) {
   return host.split(":")[0];
 }
 
+function configuredHostNames() {
+  const names = new Set(["localhost", "127.0.0.1", "::1"]);
+  for (const part of (process.env.ALLOWED_HOSTS || "").split(",")) {
+    const name = part.trim().toLowerCase();
+    if (!name || name === "*" || /[\s/\\]/.test(name)) {
+      continue;
+    }
+    names.add(name);
+  }
+  return names;
+}
+
 function hostAllowed(hostHeader) {
   const name = hostnameOf(hostHeader);
-  if (name === "localhost" || name === "127.0.0.1" || name === "::1") {
+  if (configuredHostNames().has(name)) {
     return true;
   }
   return lanOptIn() && isIP(name) !== 0;
@@ -2143,7 +2174,7 @@ async function acceptSession(request, response) {
       return;
     }
     response.writeHead(204, {
-      "Set-Cookie": `${sessionCookie}=${body.secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+      "Set-Cookie": sessionCookieHeader(request, body.secret),
       "Cache-Control": "no-store",
     });
     response.end();
@@ -2380,7 +2411,7 @@ function welcomeMessageFor(guestId) {
   }
   return {
     id: `welcome-${guestId}`,
-    author: presence.get(hostId)?.displayName || "Ankita",
+    author: presence.get(hostId)?.displayName || "Host",
     authorId: hostId,
     time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
     sentAt: new Date().toISOString(),
@@ -2798,8 +2829,19 @@ setInterval(() => {
   }
 }, 20000).unref();
 
+function shutdown() {
+  for (const server of servers) {
+    server.close();
+  }
+  process.exit(0);
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+
 console.log("Netcore Workspace");
+console.log(`Listening on ${bindHost}${bindHost === "0.0.0.0" || bindHost === "::" ? " (all interfaces)" : ""}`);
 console.log(`Data ${dataDir}`);
 for (const port of ports) {
-  console.log(`http://127.0.0.1:${port}`);
+  console.log(`Open http://127.0.0.1:${port}`);
 }

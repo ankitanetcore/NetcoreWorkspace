@@ -1,6 +1,6 @@
 # NetcoreWorkspace
 
-A peer-to-peer workspace for real-time messaging, file sharing, video calls, and team collaboration, powered by NetcoreNetwork.
+A self-hosted workspace for real-time messaging, file sharing, video calls, and team collaboration. One Node server stores the workspace. Call audio and video travel directly between browsers when the network allows. NetcoreNetwork and Causeway can connect teammates to that server; this repository does not include Causeway.
 
 One codebase can run as many independent workspaces as you want. Each workspace has its own port and its own data directory. They do not share messages, files, profiles, or settings.
 
@@ -52,3 +52,46 @@ Publish the port this instance is actually using. Teammates add that port in Cau
 `.env` is gitignored. Copy `.env.example` and fill in your own TURN settings if calls need a relay. Leave them blank to run without one.
 
 The three Getting Started documents live in `server/starter/` and are part of the application. A new workspace copies them into its own storage. Updating the app does not replace files already stored in a workspace.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8082` | HTTP and WebSocket port |
+| `HOST` | `127.0.0.1` | Bind address. `0.0.0.0` or `::` listens beyond loopback |
+| `DATA_DIR` | `server/data` | Messages, profiles, and uploads for this instance |
+| `ALLOWED_HOSTS` | empty | Extra hostnames accepted from a tunnel or reverse proxy |
+| `EXPO_PUBLIC_TURN_HOSTS` | empty | Optional TURN server for calls that cannot connect directly |
+| `EXPO_PUBLIC_TURN_USERNAME` | empty | TURN username |
+| `EXPO_PUBLIC_TURN_CREDENTIAL` | empty | TURN credential |
+
+Startup prints `Open http://127.0.0.1:<port>`. Use that address on this machine. A tunnel should forward to that port, and its public hostname must be listed in `ALLOWED_HOSTS`. A wildcard is ignored.
+
+## Privacy
+
+Messages, files, profiles, and device secrets are stored on the machine running the server. They are not end-to-end encrypted. The person who operates the server can read them. Call media is not stored by this server; a configured TURN server can relay it and would see the media. The browser loads Satoshi, Geist, and Inter from Fontshare and Google Fonts.
+
+## Troubleshooting
+
+- `Missing dist/index.html` means the web export has not been built. Run `npm run web` from the repository root.
+- `Could not listen` means that port is already in use. Choose another `PORT`.
+- A tunnel returns 403 when its hostname is not in `ALLOWED_HOSTS`, or when the page origin does not match the Host header.
+- Two browser profiles on the same port share one workspace and keep separate device identities. A second workspace needs its own `PORT` and `DATA_DIR`.
+- Calls with no TURN server work on the same machine and on networks that allow direct browser connections. Other networks need the TURN settings above.
+
+## Checks
+
+```bash
+npm run typecheck
+npm test
+```
+
+`npm test` starts a temporary server on port 8123. It does not read or write `server/data`.
+
+## Known limitations
+
+The native iOS and Android entry points use a local mock transport. The supported multi-user app is the web server started by `npm run web`. There is no account recovery if a browser loses its device secret. This server does not implement Causeway.
+
+## License
+
+NetcoreWorkspace is released under the MIT License. See `LICENSE`.
