@@ -4,7 +4,8 @@ import { fileDownloadUrl, forgetFileDownload, setFileDownload } from "@/features
 import { reportTransferFailure } from "@/features/files/transferNotice";
 import { currentClientId } from "@/session/currentIdentity";
 import { setWorkspaceHost } from "@/session/host";
-import { loadStoredIdentity } from "@/session/deviceStorage";
+import { loadDeviceCredential, loadStoredIdentity } from "@/session/deviceStorage";
+import { previewMime } from "@/features/files/fileKind";
 import { bindPresenceSender } from "@/session/presence";
 import { applyEnvelope } from "@/transport/applyEnvelope";
 import { setConnectionPhase } from "@/transport/connectionPhase";
@@ -17,6 +18,9 @@ import type {
 } from "@/transport/types";
 
 const transferTypes = new Set(["file-start", "file-chunk", "file-end"]);
+const maxTransferBytes = 32 * 1024 * 1024;
+const maxChunkCount = 2048;
+let activeSocket: WebSocket | null = null;
 
 interface FileStart {
   transferId?: string;
@@ -52,22 +56,42 @@ interface IncomingTransfer {
 
 function socketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = new URL(`${protocol}//${window.location.host}/ws`);
-  const clientId = currentClientId();
-  if (clientId) {
-    url.searchParams.set("clientId", clientId);
-  }
-  return url.toString();
+  return `${protocol}//${window.location.host}/ws`;
 }
 
 function mediaUrl(fileId: string) {
-  const clientId = currentClientId();
-  const params = new URLSearchParams();
-  if (clientId) {
-    params.set("clientId", clientId);
+  return `/media/${encodeURIComponent(fileId)}`;
+}
+
+async function ensureSession() {
+  const device = loadDeviceCredential();
+  if (!device.clientId || !device.secret) {
+    throw new Error("Missing device session");
   }
-  const query = params.toString();
-  return `/media/${encodeURIComponent(fileId)}${query ? `?${query}` : ""}`;
+  const response = await fetch("/session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(device),
+  });
+  if (!response.ok) {
+    throw new Error("Device session was rejected");
+  }
+}
+
+export function whenSocketDrained() {
+  const current = activeSocket;
+  if (!current || current.readyState !== WebSocket.OPEN || current.bufferedAmount < 1024 * 1024) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const timer = setInterval(() => {
+      if (!current || current.readyState !== WebSocket.OPEN || current.bufferedAmount < 256 * 1024) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 25);
+  });
 }
 
 function rememberStoredFile(fileId: string | undefined) {
@@ -102,9 +126,9 @@ function rememberTextDownload(file: WorkspaceFile | undefined, replace: boolean)
   if (!file?.editable || typeof URL === "undefined" || (!replace && fileDownloadUrl(file.id))) {
     return;
   }
-  setFileDownload(
+    setFileDownload(
     file.id,
-    URL.createObjectURL(new Blob([file.body], { type: file.mimeType || "text/plain" })),
+    URL.createObjectURL(new Blob([file.body], { type: previewMime(file.mimeType) })),
   );
 }
 
@@ -221,6 +245,9 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
       return;
     }
     waiting.push(envelope);
+    if (waiting.length > 200) {
+      waiting.shift();
+    }
   }
 
   function send(envelope: TransportEnvelope) {
@@ -248,7 +275,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
 
   function finishTransfer(record: IncomingTransfer) {
     const parts = record.chunks.filter((chunk): chunk is Uint8Array => chunk instanceof Uint8Array);
-    const blob = new Blob(parts as BlobPart[], { type: record.mimeType });
+    const blob = new Blob(parts as BlobPart[], { type: previewMime(record.mimeType) });
     setFileDownload(record.fileId, URL.createObjectURL(blob));
     if (!record.folderId || findFile(record.fileId)) {
       emit({
@@ -288,14 +315,22 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
   function receiveTransfer(envelope: TransportEnvelope) {
     if (envelope.type === "file-start") {
       const payload = envelope.payload as FileStart;
-      if (!payload.transferId || !payload.fileId || !payload.chunkCount) {
+      if (
+        !payload.transferId ||
+        !payload.fileId ||
+        typeof payload.chunkCount !== "number" ||
+        !Number.isInteger(payload.chunkCount) ||
+        payload.chunkCount < 1 ||
+        payload.chunkCount > maxChunkCount ||
+        (typeof payload.size === "number" && payload.size > maxTransferBytes)
+      ) {
         return;
       }
       incoming.set(payload.transferId, {
         folderId: payload.folderId || "",
         fileId: payload.fileId,
-        name: payload.name || "file",
-        mimeType: payload.mimeType || "application/octet-stream",
+        name: typeof payload.name === "string" ? payload.name : "file",
+        mimeType: previewMime(payload.mimeType),
         size: payload.size ?? 0,
         chunkCount: payload.chunkCount,
         editable: Boolean(payload.editable),
@@ -308,7 +343,14 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
     if (envelope.type === "file-chunk") {
       const payload = envelope.payload as FileChunk;
       const record = payload.transferId ? incoming.get(payload.transferId) : undefined;
-      if (!record || typeof payload.index !== "number" || typeof payload.data !== "string") {
+      if (
+        !record ||
+        typeof payload.index !== "number" ||
+        !Number.isInteger(payload.index) ||
+        payload.index < 0 ||
+        payload.index >= record.chunkCount ||
+        typeof payload.data !== "string"
+      ) {
         return;
       }
       record.chunks[payload.index] = bytesFromBase64(payload.data);
@@ -334,7 +376,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
       snapshots.rooms = {
         rooms: (payload.rooms.rooms ?? [])
           .map((room) => normalizeRoom(room))
-          .filter((room) => canAccessRoom(room, clientId)),
+          .filter((room) => room.id && room.name && canAccessRoom(room, clientId)),
       };
     }
     if (payload.direct) {
@@ -421,7 +463,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
       emit(envelope);
       return;
     }
-    if (envelope.type === "snapshot") {
+    if (envelope.type === "snapshot" && (envelope.topic as string) === "workspace") {
       try {
         applySnapshot(envelope.payload as WorkspaceSnapshot);
         hydrated = true;
@@ -627,10 +669,11 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
     publishPhase();
   }
 
-  function connect() {
+  async function connect() {
     hydrated = false;
     let next: WebSocket;
     try {
+      await ensureSession();
       next = new WebSocket(socketUrl());
     } catch (error) {
       console.log("WebSocket error", error);
@@ -638,6 +681,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
       return;
     }
     socket = next;
+    activeSocket = next;
     publishPhase();
     next.addEventListener("open", () => {
       if (socket !== next) {
@@ -670,6 +714,9 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
         return;
       }
       socket = null;
+      if (activeSocket === next) {
+        activeSocket = null;
+      }
       hydrated = false;
       if (everOpen) {
         pendingRestore = true;

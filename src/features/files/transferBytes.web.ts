@@ -2,9 +2,10 @@ import type { DocumentPickerAsset } from "expo-document-picker";
 
 import type { FileAudience, WorkspaceFile } from "@/domain/types";
 import { setFileDownload } from "@/features/files/downloads";
-import { formatBytes, isTextFile } from "@/features/files/fileKind";
+import { formatBytes, isTextFile, previewMime } from "@/features/files/fileKind";
 import { clearTransferNotice, reportTransferFailure, transferNotice } from "@/features/files/transferNotice";
 import { currentClientId } from "@/session/currentIdentity";
+import { whenSocketDrained } from "@/transport/webSocketTransport";
 import { connectionPhase } from "@/transport/connectionPhase";
 import { getTransport } from "@/transport";
 
@@ -34,7 +35,7 @@ async function readBytes(asset: DocumentPickerAsset) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
-function publishTransfer(file: WorkspaceFile, bytes: Uint8Array, folderId: string, audience?: FileAudience) {
+async function publishTransfer(file: WorkspaceFile, bytes: Uint8Array, folderId: string, audience?: FileAudience) {
   const transferId = `transfer-${file.id}`;
   const chunkCount = Math.max(1, Math.ceil(bytes.byteLength / chunkSize));
   const clientId = currentClientId();
@@ -72,6 +73,7 @@ function publishTransfer(file: WorkspaceFile, bytes: Uint8Array, folderId: strin
   });
   for (let index = 0; index < chunkCount; index += 1) {
     const slice = bytes.subarray(index * chunkSize, Math.min(bytes.byteLength, (index + 1) * chunkSize));
+    await whenSocketDrained();
     transport.publish({
       id: `${transferId}-${index}`,
       topic: "files",
@@ -97,7 +99,7 @@ async function prepareUpload(asset: DocumentPickerAsset, name: string) {
     return null;
   }
   const bytes = await readBytes(asset);
-  if (!bytes) {
+  if (!bytes || bytes.byteLength > 32 * 1024 * 1024) {
     reportTransferFailure(name);
     return null;
   }
@@ -117,7 +119,7 @@ async function prepareUpload(asset: DocumentPickerAsset, name: string) {
     uploadedAt: new Date().toISOString(),
     modifiedAt: modifiedStamp(asset.lastModified),
   };
-  setFileDownload(file.id, URL.createObjectURL(new Blob([bytes as BlobPart], { type: mimeType })));
+  setFileDownload(file.id, URL.createObjectURL(new Blob([bytes as BlobPart], { type: previewMime(mimeType) })));
   return { file, bytes };
 }
 
@@ -130,7 +132,7 @@ export async function transferUploadedFile(
   if (!prepared) {
     return { handled: true, file: null };
   }
-  publishTransfer(prepared.file, prepared.bytes, folderId);
+  await publishTransfer(prepared.file, prepared.bytes, folderId);
   return { handled: true, file: prepared.file };
 }
 
@@ -139,7 +141,7 @@ export async function transferChatFile(asset: DocumentPickerAsset, audience: Fil
   if (!prepared) {
     return null;
   }
-  publishTransfer(prepared.file, prepared.bytes, "", audience);
+  await publishTransfer(prepared.file, prepared.bytes, "", audience);
   if (transferNotice()) {
     return null;
   }

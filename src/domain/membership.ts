@@ -23,14 +23,18 @@ export function normalizeRoom(room: {
   messages?: RoomMessage[];
   access?: unknown;
   memberIds?: unknown;
+  ownerId?: unknown;
 }): Room {
   const access = roomAccessFrom(room.access);
+  const id = typeof room.id === "string" ? room.id : "";
+  const name = typeof room.name === "string" ? room.name : "";
   return {
-    id: room.id,
-    name: room.name,
+    id,
+    name,
     messages: Array.isArray(room.messages) ? room.messages : [],
     access,
     memberIds: memberIdsFrom(room.memberIds),
+    ...(typeof room.ownerId === "string" && room.ownerId ? { ownerId: room.ownerId } : {}),
   };
 }
 

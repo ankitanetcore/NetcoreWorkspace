@@ -334,6 +334,7 @@ function WebMedia({ kind, url, name }: { kind: "pdf" | "video"; url: string; nam
   return createElement("iframe", {
     src: url,
     title: name,
+    sandbox: "allow-scripts",
     style: { width: "100%", height: 560, border: "none", borderRadius: 8, backgroundColor: colors.background },
   });
 }

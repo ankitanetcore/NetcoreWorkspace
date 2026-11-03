@@ -373,6 +373,7 @@ function Thread({
   onBack?: () => void;
 }) {
   const { name, clientId } = useSession();
+  const canManage = Boolean(clientId) && (room.ownerId ? room.ownerId === clientId : workspaceHostId() === clientId);
   const { openLobby, requestJoin, restore, roomId: activeRoomId } = useCallSession();
   const liveControls = useCallControls();
   const peers = useKnownPeers();
@@ -625,6 +626,7 @@ function Thread({
       </View>
       {menuOpen ? (
         <RoomOptionsMenu
+          canManage={canManage}
           onClose={() => setMenuOpen(false)}
           onRename={() => {
             setMenuOpen(false);

@@ -193,6 +193,7 @@ export function CreateRoomDialog({
       messages: [],
       access,
       memberIds: access === "selected" ? selectedIds : [],
+      ownerId: clientId,
     };
     publishRooms("create", room.id, { room });
     onCreated(room.id);
@@ -284,11 +285,13 @@ export function RoomOptionsMenu({
   onRename,
   onMembers,
   onDelete,
+  canManage = true,
 }: {
   onClose: () => void;
   onRename: () => void;
   onMembers: () => void;
   onDelete: () => void;
+  canManage?: boolean;
 }) {
   return (
     <Overlay onClose={onClose}>
@@ -301,23 +304,27 @@ export function RoomOptionsMenu({
         >
           <Text style={styles.menuLabel}>Rename Room</Text>
         </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Manage Members"
-          onPress={onMembers}
-          style={({ pressed }) => [styles.menuItem, webPointer, pressed && styles.pressed]}
-        >
-          <Text style={styles.menuLabel}>Manage Members</Text>
-        </Pressable>
-        <View style={styles.menuDivider} />
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Delete Room"
-          onPress={onDelete}
-          style={({ pressed }) => [styles.menuItem, webPointer, pressed && styles.pressed]}
-        >
-          <Text style={styles.menuDanger}>Delete Room</Text>
-        </Pressable>
+        {canManage ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Manage Members"
+            onPress={onMembers}
+            style={({ pressed }) => [styles.menuItem, webPointer, pressed && styles.pressed]}
+          >
+            <Text style={styles.menuLabel}>Manage Members</Text>
+          </Pressable>
+        ) : null}
+        {canManage ? <View style={styles.menuDivider} /> : null}
+        {canManage ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Delete Room"
+            onPress={onDelete}
+            style={({ pressed }) => [styles.menuItem, webPointer, pressed && styles.pressed]}
+          >
+            <Text style={styles.menuDanger}>Delete Room</Text>
+          </Pressable>
+        ) : null}
       </View>
     </Overlay>
   );

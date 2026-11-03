@@ -1315,6 +1315,7 @@ function CardPreview({ file, kind }: { file: WorkspaceFile; kind: ReturnType<typ
   return createElement("iframe", {
     src: `${url}#page=1&view=FitH&toolbar=0&navpanes=0&scrollbar=0`,
     title: "",
+    sandbox: "allow-scripts",
     tabIndex: -1,
     onError: () => setFailed(true),
     style: {
@@ -1595,7 +1596,9 @@ function compareFiles(left: WorkspaceFile, right: WorkspaceFile, sortKey: SortKe
       return rightTime - leftTime;
     }
   }
-  return left.name.localeCompare(right.name);
+  const leftName = typeof left.name === "string" ? left.name : "";
+  const rightName = typeof right.name === "string" ? right.name : "";
+  return leftName.localeCompare(rightName);
 }
 
 function ownerOf(file: WorkspaceFile, people: People) {

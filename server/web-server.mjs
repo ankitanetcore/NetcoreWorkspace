@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { extname, isAbsolute, join, normalize, sep } from "node:path";
+import { isIP } from "node:net";
+import { dirname, extname, isAbsolute, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
@@ -54,12 +55,50 @@ function configuredDataDir() {
 }
 
 const ports = [configuredPort()];
+
+function configuredHost() {
+  const host = process.env.HOST?.trim();
+  return host || "127.0.0.1";
+}
+
+function lanOptIn() {
+  const host = configuredHost();
+  return host === "0.0.0.0" || host === "::";
+}
 const root = join(repoRoot, "dist");
 const dataDir = configuredDataDir();
 const workspacePath = join(dataDir, "workspace.json");
 const directoryPath = join(dataDir, "directory.json");
 const binaryDir = join(dataDir, "binaries");
 const mediaDir = join(dataDir, "media");
+const sessionsPath = join(dataDir, "sessions.json");
+const sessionCookie = "nw_device";
+const maxFileBytes = 32 * 1024 * 1024;
+const maxChunkCount = 2048;
+const maxChunkLength = 48 * 1024;
+const maxNameLength = 180;
+const maxIdLength = 80;
+const maxMessageLength = 8000;
+const maxBodyBytes = 1024 * 1024;
+const inlineMimes = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/mp4",
+  "audio/webm",
+  "audio/ogg",
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "text/plain",
+]);
+const deviceSecrets = new Map();
+let workspaceWritable = true;
+let directoryWritable = true;
 const starterDir = join(serverDir, "starter");
 const systemClientId = "netcore-workspaces";
 const systemName = "NetcoreWorkspaces";
@@ -264,7 +303,237 @@ function canSeeAudience(audience, clientId) {
 }
 
 function canSeeStoredFile(file, clientId) {
-  return canSeeAudience(file?.audience, clientId);
+  const audience = file?.audience;
+  if (!audience) {
+    return true;
+  }
+  if (audience.kind === "room") {
+    const room = workspace.rooms.rooms.find((item) => item.id === audience.roomId);
+    if (!room) {
+      return Boolean(file.clientId) && file.clientId === clientId;
+    }
+    return canAccessRoom(room, clientId);
+  }
+  return canSeeAudience(audience, clientId);
+}
+
+function fileRecord(fileId) {
+  return findAttachment(fileId) || findFile(fileId);
+}
+
+function fileIdTaken(fileId) {
+  return Boolean(findAttachment(fileId) || findFile(fileId));
+}
+
+function canStartTransfer(fileId, actor, chat) {
+  if (findAttachment(fileId) || hasStoredBytes(fileId)) {
+    return false;
+  }
+  const existing = findFile(fileId);
+  if (!existing) {
+    return true;
+  }
+  return !chat && existing.clientId === actor;
+}
+
+function storedMime(value) {
+  const base = typeof value === "string" ? value.split(";")[0].trim().toLowerCase() : "";
+  return inlineMimes.has(base) ? base : "application/octet-stream";
+}
+
+function fileRelay(type, payload, audience = null) {
+  return {
+    kind: "relay",
+    audience: audience || null,
+    data: JSON.stringify({
+      id: `files-${type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      topic: "files",
+      type,
+      sentAt: new Date().toISOString(),
+      payload,
+    }),
+  };
+}
+
+function folderTreeVisible(folderId, actor) {
+  for (const id of nestedFolderIds(folderId)) {
+    const folder = findFolder(id);
+    if (folder?.files.some((file) => !canSeeStoredFile(file, actor))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function boundedString(value, max) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > max) {
+    return "";
+  }
+  return trimmed;
+}
+
+function boundedId(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const id = value.trim();
+  if (!id || id.length > maxIdLength || /[\u0000-\u001f]/.test(id)) {
+    return "";
+  }
+  return id;
+}
+
+function validSecret(secret) {
+  return typeof secret === "string" && /^[a-f0-9]{64}$/.test(secret);
+}
+
+function validClientId(id) {
+  const bounded = boundedId(id);
+  return Boolean(bounded) && bounded === id && id !== systemClientId;
+}
+
+function writeAtomic(target, contents) {
+  mkdirSync(dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.tmp`;
+  writeFileSync(temp, contents);
+  renameSync(temp, target);
+}
+
+function loadSecrets() {
+  if (!existsSync(sessionsPath)) {
+    return;
+  }
+  try {
+    const saved = JSON.parse(readFileSync(sessionsPath, "utf8"));
+    const devices = saved?.devices && typeof saved.devices === "object" ? saved.devices : {};
+    for (const [clientId, secret] of Object.entries(devices)) {
+      if (validClientId(clientId) && validSecret(secret) && !deviceSecrets.has(secret)) {
+        deviceSecrets.set(secret, clientId);
+      }
+    }
+  } catch (error) {
+    console.error("Device sessions could not be read. Refusing to replace them.", error);
+    process.exit(1);
+  }
+}
+
+function writeSecrets() {
+  const devices = {};
+  for (const [secret, clientId] of deviceSecrets) {
+    devices[clientId] = secret;
+  }
+  writeAtomic(sessionsPath, JSON.stringify({ devices }));
+}
+
+function claimDevice(clientId, secret) {
+  if (!validClientId(clientId) || !validSecret(secret)) {
+    return "";
+  }
+  const existingId = deviceSecrets.get(secret);
+  if (existingId) {
+    return existingId === clientId ? clientId : "";
+  }
+  for (const [knownSecret, knownId] of deviceSecrets) {
+    if (knownId === clientId) {
+      return knownSecret === secret ? clientId : "";
+    }
+  }
+  deviceSecrets.set(secret, clientId);
+  try {
+    writeSecrets();
+  } catch (error) {
+    deviceSecrets.delete(secret);
+    console.error("Could not store a device session", error);
+    return "";
+  }
+  return clientId;
+}
+
+function readCookie(request, name) {
+  const header = request.headers?.cookie;
+  if (typeof header !== "string") {
+    return "";
+  }
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) {
+      continue;
+    }
+    if (part.slice(0, eq).trim() === name) {
+      try {
+        return decodeURIComponent(part.slice(eq + 1).trim());
+      } catch {
+        return "";
+      }
+    }
+  }
+  return "";
+}
+
+function sessionClientId(request) {
+  const secret = readCookie(request, sessionCookie);
+  return validSecret(secret) ? deviceSecrets.get(secret) || "" : "";
+}
+
+function hostnameOf(hostHeader) {
+  const host = String(hostHeader || "").trim().toLowerCase();
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    return end > 1 ? host.slice(1, end) : "";
+  }
+  return host.split(":")[0];
+}
+
+function hostAllowed(hostHeader) {
+  const name = hostnameOf(hostHeader);
+  if (name === "localhost" || name === "127.0.0.1" || name === "::1") {
+    return true;
+  }
+  return lanOptIn() && isIP(name) !== 0;
+}
+
+function originAllowed(origin, hostHeader) {
+  if (!origin) {
+    return true;
+  }
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return false;
+  }
+  return url.host === String(hostHeader || "").trim().toLowerCase() && hostAllowed(hostHeader);
+}
+
+function readJsonBody(request, limit = 4096) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("Body is too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.on("error", reject);
+  });
 }
 
 function audienceFits(audience, conversation) {
@@ -362,19 +631,26 @@ function scheduleSave() {
   saveTimer = setTimeout(writeWorkspace, 40);
 }
 
+function workspaceDocument() {
+  return JSON.stringify({
+    hostClientId: workspace.hostClientId,
+    welcomeMessage: workspace.welcomeMessage,
+    rooms: workspace.rooms,
+    direct: workspace.direct,
+    files: workspace.files,
+    attachments: workspace.attachments,
+  });
+}
+
 function writeWorkspace() {
-  mkdirSync(dataDir, { recursive: true });
-  writeFileSync(
-    workspacePath,
-    JSON.stringify({
-      hostClientId: workspace.hostClientId,
-      welcomeMessage: workspace.welcomeMessage,
-      rooms: workspace.rooms,
-      direct: workspace.direct,
-      files: workspace.files,
-      attachments: workspace.attachments,
-    }),
-  );
+  if (!workspaceWritable) {
+    return;
+  }
+  try {
+    writeAtomic(workspacePath, workspaceDocument());
+  } catch (error) {
+    console.error("Workspace save failed. The previous state file was kept.", error);
+  }
 }
 
 function formatByteCount(size) {
@@ -469,20 +745,12 @@ function initializeFreshWorkspace() {
     ],
   };
   workspace.attachments = [];
-  const tempPath = `${workspacePath}.tmp`;
-  mkdirSync(dataDir, { recursive: true });
-  writeFileSync(
-    tempPath,
-    JSON.stringify({
-      hostClientId: workspace.hostClientId,
-      welcomeMessage: workspace.welcomeMessage,
-      rooms: workspace.rooms,
-      direct: workspace.direct,
-      files: workspace.files,
-      attachments: workspace.attachments,
-    }),
-  );
-  renameSync(tempPath, workspacePath);
+  try {
+    writeAtomic(workspacePath, workspaceDocument());
+  } catch (error) {
+    console.error("Could not store the new workspace", error);
+    process.exit(1);
+  }
   console.log(`Initialized a new workspace in ${dataDir}`);
 }
 
@@ -508,9 +776,31 @@ function loadPersisted() {
       workspace.files = saved.files;
     }
     workspace.attachments = Array.isArray(saved.attachments) ? saved.attachments : [];
+    sanitizeWorkspace();
   } catch (error) {
-    console.log("Workspace storage could not be read", error);
+    console.error("Workspace storage could not be read. Refusing to replace it.", error);
+    process.exit(1);
   }
+}
+
+function sanitizeWorkspace() {
+  workspace.rooms.rooms = (workspace.rooms.rooms || []).filter(
+    (room) => typeof room?.id === "string" && room.id && typeof room?.name === "string" && room.name,
+  );
+  workspace.files.folders = (workspace.files.folders || []).filter(
+    (folder) => typeof folder?.id === "string" && folder.id && typeof folder?.name === "string",
+  );
+  for (const folder of workspace.files.folders) {
+    folder.files = (folder.files || []).filter(
+      (file) => typeof file?.id === "string" && file.id && typeof file?.name === "string" && file.name,
+    );
+  }
+  workspace.attachments = (workspace.attachments || []).filter(
+    (file) => typeof file?.id === "string" && file.id && typeof file?.name === "string" && file.name,
+  );
+  workspace.direct.threads = (workspace.direct.threads || []).filter(
+    (thread) => typeof thread?.id === "string" && Array.isArray(thread.participantIds) && Array.isArray(thread.messages),
+  );
 }
 
 function memberIdsFrom(value) {
@@ -552,7 +842,34 @@ function publicRoom(room) {
     messages: room.messages,
     access,
     memberIds: access === "selected" ? memberIds : [],
+    ...(typeof room.ownerId === "string" && room.ownerId ? { ownerId: room.ownerId } : {}),
   };
+}
+
+function canAdminister(room, actor) {
+  if (!room || !actor) {
+    return false;
+  }
+  if (typeof room.ownerId === "string" && room.ownerId) {
+    return room.ownerId === actor;
+  }
+  return Boolean(workspace.hostClientId) && workspace.hostClientId === actor;
+}
+
+function releaseRoomAttachments(roomId) {
+  const kept = new Set();
+  for (const folder of workspace.files.folders) {
+    for (const file of folder.files) {
+      kept.add(file.id);
+    }
+  }
+  workspace.attachments = workspace.attachments.filter((item) => {
+    if (item.audience?.kind === "room" && item.audience.roomId === roomId && !kept.has(item.id)) {
+      deleteStoredBytes(item.id);
+      return false;
+    }
+    return true;
+  });
 }
 
 function cleanEmoji(value) {
@@ -585,7 +902,7 @@ function toggleStoredReaction(message, emoji, actor) {
 }
 
 function rememberWorkspace(envelope, actorId = "") {
-  const actor = envelope.clientId || actorId || "";
+  const actor = actorId || "";
   if (envelope.topic === "rooms" && envelope.type === "message") {
     const payload = envelope.payload ?? {};
     const room = workspace.rooms.rooms.find((item) => item.id === payload.roomId);
@@ -594,16 +911,19 @@ function rememberWorkspace(envelope, actorId = "") {
       return { kind: "drop" };
     }
     const body = typeof message.body === "string" ? message.body.trim() : "";
+    if (body.length > maxMessageLength) {
+      return { kind: "drop" };
+    }
     const parentId = typeof message.parentId === "string" ? message.parentId : "";
     const shared = parentId ? undefined : acceptedSharedFile(message.file, actor, { kind: "room", roomId: room.id });
     const parent = parentId ? room.messages.find((item) => item.id === parentId && !item.parentId) : null;
-    if (!message.id || (parentId ? !parent || !body : !body && !shared)) {
+    if (!boundedId(message.id) || !actor || (parentId ? !parent || !body : !body && !shared)) {
       return { kind: "drop" };
     }
     const stored = {
       id: message.id,
       author: typeof message.author === "string" ? message.author : "",
-      authorId: parentId ? actorId || actor : typeof message.authorId === "string" ? message.authorId : actor,
+      authorId: actor,
       time: typeof message.time === "string" ? message.time : "",
       sentAt: typeof message.sentAt === "string" ? message.sentAt : new Date().toISOString(),
       body,
@@ -624,7 +944,6 @@ function rememberWorkspace(envelope, actorId = "") {
   if (envelope.topic === "rooms" && (envelope.type === "react" || envelope.type === "edit")) {
     const room = workspace.rooms.rooms.find((item) => item.id === envelope.payload?.roomId);
     const message = room?.messages.find((item) => item.id === envelope.payload?.messageId);
-    const actor = actorId || envelope.clientId || "";
     if (!room || !canAccessRoom(room, actor) || !message || !actor) {
       return { kind: "drop" };
     }
@@ -668,8 +987,9 @@ function rememberWorkspace(envelope, actorId = "") {
   }
   if (envelope.topic === "rooms" && envelope.type === "create") {
     const room = envelope.payload?.room;
-    const name = typeof room?.name === "string" ? room.name.trim() : "";
-    if (!room?.id || !name || workspace.rooms.rooms.some((item) => item.id === room.id)) {
+    const name = boundedString(room?.name, maxNameLength);
+    const roomId = boundedId(room?.id);
+    if (!roomId || !name || workspace.rooms.rooms.some((item) => item.id === roomId)) {
       return { kind: "drop" };
     }
     let { access, memberIds } = normalizeRoomRecord(room);
@@ -685,13 +1005,13 @@ function rememberWorkspace(envelope, actorId = "") {
       access = "everyone";
       memberIds = [];
     }
-    const stored = { id: room.id, name, messages: [], access, memberIds };
+    const stored = { id: roomId, name, messages: [], access, memberIds, ownerId: actor };
     workspace.rooms.rooms.push(stored);
     return { kind: "create", room: stored };
   }
   if (envelope.topic === "rooms" && envelope.type === "rename") {
     const roomId = envelope.payload?.roomId;
-    const name = typeof envelope.payload?.name === "string" ? envelope.payload.name.trim() : "";
+    const name = boundedString(envelope.payload?.name, maxNameLength);
     const room = workspace.rooms.rooms.find((item) => item.id === roomId);
     if (!room || !name || !canAccessRoom(room, actor)) {
       return { kind: "drop" };
@@ -701,7 +1021,7 @@ function rememberWorkspace(envelope, actorId = "") {
   }
   if (envelope.topic === "rooms" && envelope.type === "members") {
     const room = workspace.rooms.rooms.find((item) => item.id === envelope.payload?.roomId);
-    if (!room || !canAccessRoom(room, actor)) {
+    if (!room || !canAdminister(room, actor)) {
       return { kind: "drop" };
     }
     const current = normalizeRoomRecord(room);
@@ -722,13 +1042,14 @@ function rememberWorkspace(envelope, actorId = "") {
   if (envelope.topic === "rooms" && envelope.type === "delete") {
     const roomId = envelope.payload?.roomId;
     const room = workspace.rooms.rooms.find((item) => item.id === roomId);
-    if (!room || !canAccessRoom(room, actor)) {
+    if (!room || !canAdminister(room, actor)) {
       return { kind: "drop" };
     }
-    const hadCall = calls.has(roomId);
+    const participantIds = calls.get(roomId) ? [...calls.get(roomId).participants] : [];
+    releaseRoomAttachments(roomId);
     calls.delete(roomId);
     workspace.rooms.rooms = workspace.rooms.rooms.filter((item) => item.id !== roomId);
-    return { kind: "delete", room, hadCall };
+    return { kind: "delete", room, hadCall: participantIds.length > 0, participantIds };
   }
   if (envelope.topic === "rooms") {
     return { kind: "drop" };
@@ -737,63 +1058,83 @@ function rememberWorkspace(envelope, actorId = "") {
     const payload = envelope.payload ?? {};
     const folder = findFolder(payload.folderId);
     const file = payload.file;
-    const alreadyStored = workspace.files.folders.some((item) => item.files.some((existing) => existing.id === file?.id));
-    if (!folder || !file?.id || alreadyStored) {
-      return;
+    const fileId = boundedId(file?.id);
+    const name = boundedString(file?.name, maxNameLength);
+    if (!folder || !fileId || !name || fileIdTaken(fileId)) {
+      return { kind: "drop" };
     }
-    const { mine: _mine, ...stored } = file;
+    const body = typeof file.body === "string" ? file.body.slice(0, maxBodyBytes) : "";
+    const stored = {
+      id: fileId,
+      name,
+      detail: typeof file.detail === "string" ? file.detail.slice(0, 200) : "",
+      body,
+      editable: Boolean(file.editable),
+      mimeType: storedMime(file.mimeType),
+      size: typeof file.size === "number" && Number.isFinite(file.size) && file.size >= 0 && file.size <= maxFileBytes ? file.size : 0,
+      clientId: actor || undefined,
+      uploadedAt: new Date().toISOString(),
+      modifiedAt: new Date().toISOString(),
+    };
     folder.files.push(stored);
-    return;
+    return fileRelay("create", { folderId: folder.id, file: stored });
   }
   if (envelope.topic === "files" && envelope.type === "update") {
     const payload = envelope.payload ?? {};
     const file = findFile(payload.fileId);
-    if (file && typeof payload.body === "string" && file.editable) {
-      file.body = payload.body;
-      file.detail = "Editing";
+    if (!file || !file.editable || !canSeeStoredFile(file, actor) || typeof payload.body !== "string") {
+      return { kind: "drop" };
     }
-    return;
+    if (payload.body.length > maxBodyBytes) {
+      return { kind: "drop" };
+    }
+    file.body = payload.body;
+    file.detail = "Editing";
+    const folder = workspace.files.folders.find((item) => item.files.some((entry) => entry.id === file.id));
+    return fileRelay("update", { folderId: folder?.id || payload.folderId, fileId: file.id, body: file.body }, file.audience);
   }
   if (envelope.topic === "files" && envelope.type === "folder-create") {
     const folder = envelope.payload?.folder;
-    const name = typeof folder?.name === "string" ? folder.name.trim() : "";
-    if (!folder?.id || !name || workspace.files.folders.some((item) => item.id === folder.id)) {
-      return;
+    const name = boundedString(folder?.name, maxNameLength);
+    const folderId = boundedId(folder?.id);
+    if (!folderId || !name || workspace.files.folders.some((item) => item.id === folderId)) {
+      return { kind: "drop" };
     }
     const parentId = typeof folder.parentId === "string" ? folder.parentId.trim() : "";
     if (parentId && !findFolder(parentId)) {
-      return;
+      return { kind: "drop" };
     }
-    const stored = { id: folder.id, name, files: [] };
+    const stored = { id: folderId, name, files: [] };
     if (parentId) {
       stored.parentId = parentId;
     }
     workspace.files.folders.push(stored);
-    return;
+    return fileRelay("folder-create", { folder: stored });
   }
   if (envelope.topic === "files" && envelope.type === "folder-rename") {
     const folder = findFolder(envelope.payload?.folderId);
-    const name = typeof envelope.payload?.name === "string" ? envelope.payload.name.trim() : "";
-    if (folder && name) {
-      folder.name = name;
+    const name = boundedString(envelope.payload?.name, maxNameLength);
+    if (!folder || !name) {
+      return { kind: "drop" };
     }
-    return;
+    folder.name = name;
+    return fileRelay("folder-rename", { folderId: folder.id, name });
   }
   if (envelope.topic === "files" && envelope.type === "folder-move") {
     const folder = findFolder(envelope.payload?.folderId);
     const parentId = typeof envelope.payload?.parentId === "string" ? envelope.payload.parentId.trim() : "";
     if (!folder) {
-      return;
+      return { kind: "drop" };
     }
     if (!parentId) {
       delete folder.parentId;
-      return;
+      return fileRelay("folder-move", { folderId: folder.id, parentId: "" });
     }
     if (parentId === folder.id || nestedFolderIds(folder.id).has(parentId) || !findFolder(parentId)) {
-      return;
+      return { kind: "drop" };
     }
     folder.parentId = parentId;
-    return;
+    return fileRelay("folder-move", { folderId: folder.id, parentId });
   }
   if (envelope.topic === "files" && envelope.type === "folder-reorder") {
     const parentId = typeof envelope.payload?.parentId === "string" ? envelope.payload.parentId.trim() : "";
@@ -801,11 +1142,11 @@ function rememberWorkspace(envelope, actorId = "") {
       ? envelope.payload.folderIds.filter((id) => typeof id === "string" && id)
       : [];
     if (new Set(folderIds).size !== folderIds.length) {
-      return;
+      return { kind: "drop" };
     }
     const siblings = workspace.files.folders.filter((folder) => folderParentKey(folder) === parentId);
     if (folderIds.length !== siblings.length || folderIds.some((id) => !siblings.some((folder) => folder.id === id))) {
-      return;
+      return { kind: "drop" };
     }
     for (let index = 0; index < folderIds.length; index += 1) {
       const folder = findFolder(folderIds[index]);
@@ -813,12 +1154,12 @@ function rememberWorkspace(envelope, actorId = "") {
         folder.order = index;
       }
     }
-    return;
+    return fileRelay("folder-reorder", { parentId, folderIds });
   }
   if (envelope.topic === "files" && envelope.type === "folder-delete") {
     const folder = findFolder(envelope.payload?.folderId);
-    if (!folder) {
-      return;
+    if (!folder || !folderTreeVisible(folder.id, actor)) {
+      return { kind: "drop" };
     }
     const ids = nestedFolderIds(folder.id);
     for (const item of workspace.files.folders) {
@@ -830,46 +1171,48 @@ function rememberWorkspace(envelope, actorId = "") {
       }
     }
     workspace.files.folders = workspace.files.folders.filter((item) => !ids.has(item.id));
-    return;
+    return fileRelay("folder-delete", { folderId: folder.id });
   }
   if (envelope.topic === "files" && envelope.type === "file-rename") {
     const file = findFile(envelope.payload?.fileId);
-    const name = typeof envelope.payload?.name === "string" ? envelope.payload.name.trim() : "";
-    if (file && name) {
-      file.name = name;
-      if (typeof envelope.payload?.modifiedAt === "string" && envelope.payload.modifiedAt) {
-        file.modifiedAt = envelope.payload.modifiedAt;
-      }
+    const name = boundedString(envelope.payload?.name, maxNameLength);
+    if (!file || !name || !canSeeStoredFile(file, actor)) {
+      return { kind: "drop" };
     }
-    return;
+    file.name = name;
+    file.modifiedAt = new Date().toISOString();
+    return fileRelay("file-rename", { fileId: file.id, name, modifiedAt: file.modifiedAt }, file.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-pin") {
     const file = findFile(envelope.payload?.fileId);
-    if (file) {
-      if (envelope.payload?.pinned === true) {
-        file.pinned = true;
-      } else {
-        delete file.pinned;
-      }
+    if (!file || !canSeeStoredFile(file, actor)) {
+      return { kind: "drop" };
     }
-    return;
+    if (envelope.payload?.pinned === true) {
+      file.pinned = true;
+    } else {
+      delete file.pinned;
+    }
+    return fileRelay("file-pin", { fileId: file.id, pinned: file.pinned === true }, file.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-delete") {
-    const fileId = envelope.payload?.fileId;
-    if (!fileId) {
-      return;
+    const fileId = boundedId(envelope.payload?.fileId);
+    const stored = fileRecord(fileId);
+    if (!fileId || !stored || !canSeeStoredFile(stored, actor)) {
+      return { kind: "drop" };
     }
     for (const folder of workspace.files.folders) {
       folder.files = folder.files.filter((file) => file.id !== fileId);
     }
     forgetStoredFile(fileId);
-    return;
+    return fileRelay("file-delete", { fileId }, stored.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-move") {
-    const fileId = envelope.payload?.fileId;
+    const fileId = boundedId(envelope.payload?.fileId);
     const target = findFolder(envelope.payload?.toFolderId);
-    if (!fileId || !target) {
-      return;
+    const stored = fileRecord(fileId);
+    if (!fileId || !target || !stored || !canSeeStoredFile(stored, actor)) {
+      return { kind: "drop" };
     }
     let moving;
     for (const folder of workspace.files.folders) {
@@ -878,97 +1221,157 @@ function rememberWorkspace(envelope, actorId = "") {
         continue;
       }
       if (folder.id === target.id) {
-        return;
+        return { kind: "drop" };
       }
       moving = folder.files[index];
       folder.files.splice(index, 1);
       break;
     }
-    if (moving && !target.files.some((file) => file.id === fileId)) {
-      target.files.push(moving);
+    if (!moving || target.files.some((file) => file.id === fileId)) {
+      return { kind: "drop" };
     }
-    return;
+    target.files.push(moving);
+    return fileRelay("file-move", { fileId, toFolderId: target.id }, stored.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-start") {
     const payload = envelope.payload ?? {};
-    if (!payload.transferId || !payload.fileId) {
-      return;
-    }
+    const transferId = boundedId(payload.transferId);
+    const fileId = boundedId(payload.fileId);
+    const name = boundedString(payload.name, maxNameLength);
+    const chunkCount = payload.chunkCount;
+    const size = payload.size;
     const chat = !payload.folderId;
     const audience = chat ? readAudience(payload, actor) : null;
-    if (chat && !audience) {
-      return;
+    if (
+      !actor ||
+      !transferId ||
+      !fileId ||
+      safeFileId(fileId) !== fileId ||
+      !name ||
+      !canStartTransfer(fileId, actor, chat) ||
+      transfers.has(transferId) ||
+      !Number.isInteger(chunkCount) ||
+      chunkCount < 1 ||
+      chunkCount > maxChunkCount ||
+      typeof size !== "number" ||
+      !Number.isFinite(size) ||
+      size < 0 ||
+      size > maxFileBytes ||
+      (chat && !audience) ||
+      (!chat && !findFolder(payload.folderId))
+    ) {
+      return { kind: "drop" };
     }
-    transferAudience.set(payload.transferId, audience);
-    transfers.set(payload.transferId, {
-      fileId: payload.fileId,
-      folderId: payload.folderId || "",
-      name: payload.name,
-      mimeType: payload.mimeType || "application/octet-stream",
-      size: payload.size ?? 0,
-      chunkCount: payload.chunkCount ?? 0,
+    const body = typeof payload.body === "string" ? payload.body.slice(0, maxBodyBytes) : "";
+    const record = {
+      fileId,
+      folderId: chat ? "" : payload.folderId,
+      name,
+      mimeType: storedMime(payload.mimeType),
+      size,
+      chunkCount,
       editable: Boolean(payload.editable),
-      body: payload.body ?? "",
-      detail: payload.detail || "Uploaded",
-      clientId: payload.clientId || envelope.clientId || actor || "",
+      body,
+      detail: typeof payload.detail === "string" ? payload.detail.slice(0, 200) : "Uploaded",
+      clientId: actor,
+      ownerId: actor,
       chunks: [],
       chat,
       audience,
-    });
-    return;
+    };
+    transferAudience.set(transferId, audience);
+    transfers.set(transferId, record);
+    return fileRelay(
+      "file-start",
+      {
+        transferId,
+        folderId: record.folderId,
+        fileId,
+        name,
+        mimeType: record.mimeType,
+        size,
+        chunkCount,
+        editable: record.editable,
+        body,
+        detail: record.detail,
+        audience,
+      },
+      audience,
+    );
   }
   if (envelope.topic === "files" && envelope.type === "file-chunk") {
     const payload = envelope.payload ?? {};
     const record = transfers.get(payload.transferId);
-    if (!record || typeof payload.index !== "number" || typeof payload.data !== "string") {
-      return;
+    if (
+      !record ||
+      record.ownerId !== actor ||
+      !Number.isInteger(payload.index) ||
+      payload.index < 0 ||
+      payload.index >= record.chunkCount ||
+      typeof payload.data !== "string" ||
+      payload.data.length > maxChunkLength
+    ) {
+      return { kind: "drop" };
     }
     record.chunks[payload.index] = payload.data;
-    return;
+    return fileRelay("file-chunk", { transferId: payload.transferId, index: payload.index, data: payload.data }, record.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-end") {
-    const record = transfers.get(envelope.payload?.transferId);
-    if (!record) {
-      return;
+    const transferId = envelope.payload?.transferId;
+    const record = transfers.get(transferId);
+    if (!record || record.ownerId !== actor) {
+      return { kind: "drop" };
     }
-    transfers.delete(envelope.payload.transferId);
-    const parts = record.chunks.filter((chunk) => typeof chunk === "string").map((chunk) => Buffer.from(chunk, "base64"));
+    transfers.delete(transferId);
+    transferAudience.delete(transferId);
+    let complete = true;
+    for (let index = 0; index < record.chunkCount; index += 1) {
+      if (typeof record.chunks[index] !== "string") {
+        complete = false;
+      }
+    }
     const raw = rawMediaPath(record.fileId);
-    if (raw) {
-      mkdirSync(mediaDir, { recursive: true });
-      writeFileSync(raw, Buffer.concat(parts));
+    if (!complete || !raw || hasStoredBytes(record.fileId) || findAttachment(record.fileId)) {
+      return { kind: "drop" };
+    }
+    const buffer = Buffer.concat(record.chunks.map((chunk) => Buffer.from(chunk, "base64")));
+    if (buffer.length !== record.size || buffer.length > maxFileBytes) {
+      return { kind: "drop" };
+    }
+    try {
+      writeAtomic(raw, buffer);
       rmSync(legacyBinaryPath(record.fileId), { force: true });
+    } catch (error) {
+      console.error("Could not store uploaded bytes", error);
+      return { kind: "drop" };
     }
     if (record.chat) {
-      if (!findAttachment(record.fileId)) {
-        workspace.attachments.push({
-          id: record.fileId,
-          name: record.name || "file",
-          detail: record.detail,
-          body: record.body,
-          editable: record.editable,
-          mimeType: record.mimeType,
-          size: record.size,
-          clientId: record.clientId || undefined,
-          audience: record.audience,
-          folderId: "",
-        });
-      }
-      return;
-    }
-    if (!findFile(record.fileId)) {
-      const folder = findFolder(record.folderId);
-      folder?.files.push({
+      workspace.attachments.push({
         id: record.fileId,
-        name: record.name || "file",
+        name: record.name,
         detail: record.detail,
         body: record.body,
         editable: record.editable,
         mimeType: record.mimeType,
         size: record.size,
-        clientId: record.clientId || undefined,
+        clientId: record.clientId,
+        audience: record.audience,
+        folderId: "",
+      });
+    } else if (!findFile(record.fileId)) {
+      const folder = findFolder(record.folderId);
+      folder?.files.push({
+        id: record.fileId,
+        name: record.name,
+        detail: record.detail,
+        body: record.body,
+        editable: record.editable,
+        mimeType: record.mimeType,
+        size: record.size,
+        clientId: record.clientId,
       });
     }
+    return fileRelay("file-end", { transferId }, record.audience);
   }
   if (envelope.topic === "files" && envelope.type === "file-organize") {
     const fileId = envelope.payload?.fileId;
@@ -1034,10 +1437,6 @@ function roomEvent(type, payload) {
   });
 }
 
-function textFrame(data) {
-  return typeof data === "string" ? data : data.toString();
-}
-
 function relayToAccess(room, data, except) {
   for (const client of clients) {
     if (client === except || client.readyState !== 1 || !canAccessRoom(room, client.clientId)) {
@@ -1082,6 +1481,19 @@ function relayRoomResult(result, raw, socket) {
     return;
   }
   if (result.kind === "delete") {
+    for (const id of result.participantIds || []) {
+      relayToAccess(
+        result.room,
+        JSON.stringify({
+          id: `call-revoke-${id}-${Date.now()}`,
+          topic: "call",
+          type: "revoke",
+          sentAt: new Date().toISOString(),
+          payload: { roomId: result.room.id, clientId: id },
+        }),
+        socket,
+      );
+    }
     relayToAccess(result.room, roomEvent("delete", { roomId: result.room.id }), socket);
     if (result.hadCall) {
       relayToAccess(result.room, callStatusMessage(result.room.id, { roomId: result.room.id, active: false }), socket);
@@ -1105,12 +1517,34 @@ function relayRoomResult(result, raw, socket) {
       socket,
     );
     for (const id of result.lost) {
+      const inCall = Boolean(calls.get(result.room.id)?.participants.has(id));
+      revokeParticipant(result.room, id);
       sendToPeer(id, roomEvent("delete", { roomId: result.room.id }));
-      if (calls.has(result.room.id)) {
+      if (inCall) {
         sendToPeer(id, callStatusMessage(result.room.id, { roomId: result.room.id, active: false }));
       }
     }
   }
+}
+
+function revokeParticipant(room, clientId) {
+  const call = calls.get(room.id);
+  if (!call?.participants.has(clientId)) {
+    return;
+  }
+  call.participants.delete(clientId);
+  if (call.participants.size === 0) {
+    calls.delete(room.id);
+  }
+  const data = JSON.stringify({
+    id: `call-revoke-${clientId}-${Date.now()}`,
+    topic: "call",
+    type: "revoke",
+    sentAt: new Date().toISOString(),
+    payload: { roomId: room.id, clientId },
+  });
+  relayToAccess(room, data, null);
+  broadcastCallStatus(room.id);
 }
 
 function broadcastCallStatus(roomId) {
@@ -1142,7 +1576,7 @@ function rememberCall(envelope, socketClientId) {
   }
   const payload = envelope.payload ?? {};
   const roomId = typeof payload.roomId === "string" ? payload.roomId : "";
-  const clientId = payload.clientId || payload.from || envelope.clientId || socketClientId || "";
+  const clientId = socketClientId || "";
   if (!roomId || !clientId) {
     return;
   }
@@ -1196,10 +1630,11 @@ function abandonTransfers(clientId) {
     return;
   }
   for (const [transferId, record] of [...transfers.entries()]) {
-    if (record.clientId !== clientId) {
+    if (record.ownerId !== clientId && record.clientId !== clientId) {
       continue;
     }
     transfers.delete(transferId);
+    transferAudience.delete(transferId);
     if (hasStoredBytes(record.fileId)) {
       continue;
     }
@@ -1221,11 +1656,7 @@ function abandonTransfers(clientId) {
       sentAt: new Date().toISOString(),
       payload: { fileId: record.fileId },
     });
-    for (const client of clients) {
-      if (client.readyState === 1) {
-        client.send(data);
-      }
-    }
+    sendToAudience(record.audience, data, null, true);
   }
 }
 
@@ -1239,6 +1670,9 @@ function cleanDirectMessage(message, actor, other) {
     return null;
   }
   const body = typeof message.body === "string" ? message.body.trim() : "";
+  if (body.length > maxMessageLength) {
+    return null;
+  }
   const parentId = typeof message.parentId === "string" ? message.parentId : "";
   const shared = parentId ? undefined : acceptedSharedFile(message.file, actor, { kind: "direct", participantIds: [actor, other] });
   if (parentId ? !body : !body && !shared) {
@@ -1266,27 +1700,26 @@ function cleanDirectMessage(message, actor, other) {
 }
 
 function rememberDirect(envelope, actorId = "") {
-  const actor = actorId || envelope.clientId || "";
+  const actor = actorId || "";
   if (envelope.type === "react" || envelope.type === "edit") {
     return mutateDirect(envelope, actor);
   }
   if (envelope.type !== "message") {
     return { kind: "drop" };
   }
-  const claimed = envelope.clientId || actorId || "";
   const ids = memberIdsFrom(envelope.payload?.participantIds);
-  const other = ids.find((id) => id !== claimed);
-  if (!claimed || ids.length !== 2 || !ids.includes(claimed) || !other || !presence.has(other)) {
+  const other = ids.find((id) => id !== actor);
+  if (!actor || ids.length !== 2 || !ids.includes(actor) || !other || !presence.has(other)) {
     return { kind: "drop" };
   }
-  const message = cleanDirectMessage(envelope.payload?.message, actorId || claimed, other);
+  const message = cleanDirectMessage(envelope.payload?.message, actor, other);
   if (!message) {
     return { kind: "drop" };
   }
-  const id = directThreadId(claimed, other);
+  const id = directThreadId(actor, other);
   let thread = workspace.direct.threads.find((item) => item.id === id);
   if (!thread) {
-    thread = { id, participantIds: [claimed, other].sort(), messages: [] };
+    thread = { id, participantIds: [actor, other].sort(), messages: [] };
     workspace.direct.threads.push(thread);
   }
   if (message.parentId && !thread.messages.some((item) => item.id === message.parentId && !item.parentId)) {
@@ -1434,7 +1867,12 @@ const types = {
 };
 
 function filePath(urlPath) {
-  const decoded = decodeURIComponent(urlPath.split("?")[0]);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(urlPath.split("?")[0]);
+  } catch {
+    return { badEncoding: true };
+  }
   const relative = decoded === "/" ? "/index.html" : decoded;
   const full = normalize(join(root, relative));
   if (full !== root && !full.startsWith(root + sep)) {
@@ -1443,13 +1881,34 @@ function filePath(urlPath) {
   return full;
 }
 
-function sendFile(response, full) {
+function pipeStream(request, response, stream) {
+  const fail = (error) => {
+    console.log("Stream failed", error);
+    if (!response.headersSent) {
+      response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Could not read that file.");
+      return;
+    }
+    response.destroy();
+  };
+  stream.on("error", fail);
+  request.on("aborted", () => stream.destroy());
+  response.on("close", () => {
+    if (!response.writableFinished) {
+      stream.destroy();
+    }
+  });
+  stream.pipe(response);
+}
+
+function sendFile(response, request, full) {
   const type = types[extname(full)] ?? "application/octet-stream";
   response.writeHead(200, {
     "Content-Type": type,
+    "X-Content-Type-Options": "nosniff",
     "Cache-Control": "no-cache",
   });
-  createReadStream(full).pipe(response);
+  pipeStream(request, response, createReadStream(full));
 }
 
 function contentName(name) {
@@ -1501,10 +1960,15 @@ function convertLegacyBinary(jsonPath, rawPath) {
       if (settled) {
         return;
       }
+      try {
+        renameSync(partial, rawPath);
+      } catch (error) {
+        fail(error);
+        return;
+      }
       settled = true;
       input.removeAllListeners("error");
       input.destroy();
-      renameSync(partial, rawPath);
       resolve(rawPath);
     }
 
@@ -1585,18 +2049,25 @@ function ensureRaw(fileId) {
   return job;
 }
 
+function mediaHeaders(mimeType, name) {
+  const base = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  const inline = inlineMimes.has(base);
+  return {
+    "Content-Type": inline ? (base === "text/plain" ? "text/plain; charset=utf-8" : base) : "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, no-store",
+    "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${contentName(name)}"`,
+  };
+}
+
 function streamBytes(request, response, filePath, mimeType, name) {
   const size = statSync(filePath).size;
-  const headers = {
-    "Content-Type": mimeType || "application/octet-stream",
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=3600",
-    "Content-Disposition": `inline; filename="${contentName(name)}"`,
-  };
+  const headers = mediaHeaders(mimeType, name);
   const range = request.headers.range;
   if (!range) {
     response.writeHead(200, { ...headers, "Content-Length": size });
-    createReadStream(filePath).pipe(response);
+    pipeStream(request, response, createReadStream(filePath));
     return;
   }
   const match = /^bytes=(\d*)-(\d*)$/.exec(range);
@@ -1625,7 +2096,7 @@ function streamBytes(request, response, filePath, mimeType, name) {
     "Content-Range": `bytes ${start}-${end}/${size}`,
     "Content-Length": end - start + 1,
   });
-  createReadStream(filePath, { start, end }).pipe(response);
+  pipeStream(request, response, createReadStream(filePath, { start, end }));
 }
 
 async function serveMedia(request, response) {
@@ -1637,9 +2108,9 @@ async function serveMedia(request, response) {
       response.end("File not found.");
       return;
     }
-    const stored = findFile(fileId) || findAttachment(fileId);
-    const clientId = url.searchParams.get("clientId") || "";
-    if (!stored || !canSeeStoredFile(stored, clientId)) {
+    const stored = fileRecord(fileId);
+    const clientId = sessionClientId(request);
+    if (!clientId || !stored || !canSeeStoredFile(stored, clientId)) {
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       response.end("File not found.");
       return;
@@ -1662,9 +2133,49 @@ async function serveMedia(request, response) {
   }
 }
 
-function handler(request, response) {
+async function acceptSession(request, response) {
+  try {
+    const body = await readJsonBody(request);
+    const clientId = claimDevice(body?.clientId, body?.secret);
+    if (!clientId) {
+      response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Forbidden");
+      return;
+    }
+    response.writeHead(204, {
+      "Set-Cookie": `${sessionCookie}=${body.secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+      "Cache-Control": "no-store",
+    });
+    response.end();
+  } catch (error) {
+    console.log("Session request failed", error);
+    if (!response.headersSent) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Bad request.");
+    }
+  }
+}
+
+function route(request, response) {
   const url = request.url ?? "/";
-  console.log(`${request.method || "GET"} ${url.split("?")[0]}`);
+  const path = url.split("?")[0];
+  console.log(`${request.method || "GET"} ${path}`);
+  const host = request.headers.host || "";
+  if (!hostAllowed(host)) {
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Forbidden");
+    return;
+  }
+  const origin = request.headers.origin;
+  if (typeof origin === "string" && origin && !originAllowed(origin, host)) {
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Forbidden");
+    return;
+  }
+  if (request.method === "POST" && path === "/session") {
+    void acceptSession(request, response);
+    return;
+  }
   if (url.startsWith("/ws")) {
     response.writeHead(426);
     response.end();
@@ -1674,14 +2185,19 @@ function handler(request, response) {
     void serveMedia(request, response);
     return;
   }
-  const full = filePath(url);
-  if (!full) {
+  const located = filePath(url);
+  if (located?.badEncoding) {
+    response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Bad request.");
+    return;
+  }
+  if (!located || typeof located !== "string") {
     response.writeHead(403);
     response.end();
     return;
   }
-  if (existsSync(full) && statSync(full).isFile()) {
-    sendFile(response, full);
+  if (existsSync(located) && statSync(located).isFile()) {
+    sendFile(response, request, located);
     return;
   }
   const fallback = join(root, "index.html");
@@ -1690,14 +2206,20 @@ function handler(request, response) {
     response.end("Missing dist/index.html. Run the web build first.");
     return;
   }
-  sendFile(response, fallback);
+  sendFile(response, request, fallback);
 }
 
-function clientIdFromRequest(request) {
+function handler(request, response) {
   try {
-    return new URL(request?.url ?? "/ws", "http://127.0.0.1").searchParams.get("clientId") || "";
-  } catch {
-    return "";
+    route(request, response);
+  } catch (error) {
+    console.log("Request failed", error);
+    if (!response.headersSent) {
+      response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Request failed.");
+    } else {
+      response.destroy();
+    }
   }
 }
 
@@ -1748,8 +2270,14 @@ function writeDirectory() {
       }
       return person;
     });
-  mkdirSync(dataDir, { recursive: true });
-  writeFileSync(directoryPath, JSON.stringify({ people }));
+  if (!directoryWritable) {
+    return;
+  }
+  try {
+    writeAtomic(directoryPath, JSON.stringify({ people }));
+  } catch (error) {
+    console.error("People directory save failed. The previous file was kept.", error);
+  }
 }
 
 function profileText(value, previous = "") {
@@ -1815,6 +2343,11 @@ function claimHost(clientId) {
     return;
   }
   workspace.hostClientId = clientId;
+  for (const room of workspace.rooms.rooms) {
+    if (typeof room.ownerId !== "string" || !room.ownerId) {
+      room.ownerId = clientId;
+    }
+  }
   scheduleSave();
 }
 
@@ -1985,7 +2518,8 @@ function loadDirectory() {
       }
     }
   } catch (error) {
-    console.error("Could not read the people directory", error);
+    directoryWritable = false;
+    console.error("People directory could not be read. Refusing to replace it.", error);
   }
 }
 
@@ -2050,33 +2584,6 @@ function sendToAudience(audience, data, sender, includeSender = false) {
   }
 }
 
-function relayFileEvent(envelope, raw, socket) {
-  const type = envelope?.type;
-  const transferId = envelope?.payload?.transferId;
-  if (type === "file-start" || type === "file-chunk" || type === "file-end") {
-    if (!transferAudience.has(transferId)) {
-      return;
-    }
-    if ((type === "file-start" || type === "file-chunk") && !transfers.has(transferId)) {
-      return;
-    }
-    const audience = transferAudience.get(transferId);
-    if (type === "file-end") {
-      transferAudience.delete(transferId);
-    }
-    sendToAudience(audience, textFrame(raw), socket);
-    return;
-  }
-  if (type === "file-organize") {
-    return;
-  }
-  for (const client of clients) {
-    if (client !== socket && client.readyState === 1) {
-      client.send(textFrame(raw));
-    }
-  }
-}
-
 function relayOrganize(result) {
   if (!result || result.kind !== "organize") {
     return;
@@ -2091,10 +2598,32 @@ function relayOrganize(result) {
   sendToAudience(result.audience, data, null, true);
 }
 
+const callClientTypes = new Set(["call-started", "join", "leave", "offer", "answer", "ice", "state"]);
+
 function attachRelay(server) {
-  const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 * 1024 });
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    maxPayload: 1024 * 1024,
+    verifyClient(info, callback) {
+      const request = info.req;
+      const host = request.headers.host || "";
+      const origin = request.headers.origin;
+      if (!hostAllowed(host) || (typeof origin === "string" && origin && !originAllowed(origin, host))) {
+        callback(false, 403, "Forbidden");
+        return;
+      }
+      const clientId = sessionClientId(request);
+      if (!clientId) {
+        callback(false, 401, "Unauthorized");
+        return;
+      }
+      request.sessionClientId = clientId;
+      callback(true);
+    },
+  });
   wss.on("connection", (socket, request) => {
-    const clientId = publicClientId(clientIdFromRequest(request));
+    const clientId = publicClientId(request.sessionClientId || "");
     socket.clientId = clientId;
     socket.loopback = isLoopback(request.socket?.remoteAddress);
     if (socket.loopback) {
@@ -2124,10 +2653,12 @@ function attachRelay(server) {
         try {
           const envelope = JSON.parse(data.toString());
           if (envelope?.topic === "presence" && envelope?.type === "hello") {
-            const id = publicClientId(envelope.clientId || envelope.payload?.clientId || socket.clientId);
-            socket.clientId = id || socket.clientId;
+            const id = socket.clientId;
+            if (!id) {
+              return;
+            }
             if (socket.loopback) {
-              claimHost(socket.clientId);
+              claimHost(id);
             }
             upsertPeer(id, envelope.payload?.displayName || "", true, false, {
               title: envelope.payload?.title,
@@ -2149,14 +2680,22 @@ function attachRelay(server) {
             return;
           }
           if (envelope?.topic === "call") {
+            if (!callClientTypes.has(envelope.type)) {
+              return;
+            }
             const roomId = typeof envelope.payload?.roomId === "string" ? envelope.payload.roomId : "";
             const room = workspace.rooms.rooms.find((item) => item.id === roomId);
-            const actor = envelope.clientId || envelope.payload?.clientId || envelope.payload?.from || socket.clientId || "";
+            const actor = socket.clientId || "";
             if (!canAccessRoom(room, actor)) {
               return;
             }
-            rememberCall(envelope, socket.clientId || "");
-            relayToAccess(room, textFrame(data), socket);
+            const outbound = {
+              ...envelope,
+              clientId: actor,
+              payload: { ...(envelope.payload || {}), clientId: actor, from: actor },
+            };
+            rememberCall(outbound, actor);
+            relayToAccess(room, JSON.stringify(outbound), socket);
             return;
           }
           if (envelope?.topic === "rooms") {
@@ -2176,27 +2715,22 @@ function attachRelay(server) {
             return;
           }
           if (envelope?.topic === "files") {
-            const result = rememberWorkspace(envelope, socket.clientId || "");
-            if (envelope.type === "file-organize") {
-              relayOrganize(result);
-            } else {
-              relayFileEvent(envelope, data, socket);
+            if (envelope.type === "snapshot") {
+              return;
             }
-            if (envelope.type !== "file-start" && envelope.type !== "file-chunk") {
+            const result = rememberWorkspace(envelope, socket.clientId || "");
+            if (result?.kind === "organize") {
+              relayOrganize(result);
+            } else if (result?.kind === "relay") {
+              sendToAudience(result.audience, result.data, socket);
+            }
+            if ((result?.kind === "relay" || result?.kind === "organize") && envelope.type !== "file-start" && envelope.type !== "file-chunk") {
               scheduleSave();
             }
             return;
           }
-          if (envelope?.type !== "snapshot") {
-            rememberWorkspace(envelope, socket.clientId || "");
-          }
         } catch {
           return;
-        }
-      }
-      for (const client of clients) {
-        if (client !== socket && client.readyState === 1) {
-          client.send(data, { binary: isBinary });
         }
       }
     });
@@ -2225,6 +2759,7 @@ if (!existsSync(join(root, "index.html"))) {
   process.exit(1);
 }
 
+loadSecrets();
 if (existsSync(workspacePath)) {
   loadPersisted();
   loadDirectory();
@@ -2235,20 +2770,23 @@ if (existsSync(workspacePath)) {
   initializeFreshWorkspace();
 }
 
+const bindHost = configuredHost();
 const servers = [];
 for (const port of ports) {
   try {
-    servers.push(await listen("0.0.0.0", port));
+    servers.push(await listen(bindHost, port));
   } catch (error) {
-    console.error(`Could not listen on 0.0.0.0:${port}`);
+    console.error(`Could not listen on ${bindHost}:${port}`);
     console.error(error);
     process.exit(1);
   }
-  try {
-    servers.push(await listen("::1", port));
-  } catch (error) {
-    console.error(`Could not listen on [::1]:${port}`);
-    console.error(error);
+  if (bindHost === "127.0.0.1") {
+    try {
+      servers.push(await listen("::1", port));
+    } catch (error) {
+      console.error(`Could not listen on [::1]:${port}`);
+      console.error(error);
+    }
   }
 }
 

@@ -203,7 +203,7 @@ export function applyEnvelope(snapshots: TransportSnapshots, envelope: Transport
     const folder = snapshots.files.folders.find((item) => item.id === payload.folderId);
     const fileId = payload.file?.id;
     const alreadyStored = snapshots.files.folders.some((item) => item.files.some((file) => file.id === fileId));
-    if (!folder || !payload.file || !fileId || alreadyStored) {
+    if (!folder || !payload.file || typeof fileId !== "string" || !fileId || typeof payload.file.name !== "string" || alreadyStored) {
       return;
     }
     folder.files.push({ ...payload.file });
@@ -399,11 +399,12 @@ export function applyEnvelope(snapshots: TransportSnapshots, envelope: Transport
   if (envelope.topic === "rooms" && envelope.type === "create") {
     const room = (
       envelope.payload as {
-        room?: { id?: string; name?: string; access?: unknown; memberIds?: unknown; messages?: unknown };
+        room?: { id?: string; name?: string; access?: unknown; memberIds?: unknown; messages?: unknown; ownerId?: unknown };
       }
     ).room;
-    const name = room?.name?.trim();
-    if (!room?.id || !name || snapshots.rooms.rooms.some((item) => item.id === room.id)) {
+    const name = typeof room?.name === "string" ? room.name.trim() : "";
+    const roomId = typeof room?.id === "string" ? room.id.trim() : "";
+    if (!room || !roomId || !name || snapshots.rooms.rooms.some((item) => item.id === roomId)) {
       return;
     }
     const access = roomAccessFrom(room.access);
@@ -412,11 +413,12 @@ export function applyEnvelope(snapshots: TransportSnapshots, envelope: Transport
       return;
     }
     snapshots.rooms.rooms.push({
-      id: room.id,
+      id: roomId,
       name,
       access,
       memberIds,
       messages: storedMessages(room.messages),
+      ...(typeof room.ownerId === "string" && room.ownerId ? { ownerId: room.ownerId } : {}),
     });
     return;
   }

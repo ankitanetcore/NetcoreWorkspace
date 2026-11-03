@@ -258,6 +258,7 @@ function PdfPreview({ url, name, file }: { url: string; name: string; file: Work
       {createElement("iframe", {
         src: url,
         title: name,
+        sandbox: "allow-scripts",
         onLoad: () => setReady(true),
         onError: () => setFailed(true),
         style: {

@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 
 import { createClientId } from "@/session/createClientId";
 import { rememberIdentity } from "@/session/currentIdentity";
-import { loadStoredIdentity, storeIdentity } from "@/session/deviceStorage";
+import { loadDeviceCredential, loadStoredIdentity, storeIdentity } from "@/session/deviceStorage";
 import { announcePresence } from "@/session/presence";
 import { cleanProfile, type ProfileInput } from "@/session/profile";
 
@@ -24,19 +24,21 @@ function initialSession() {
   if (typeof window === "undefined") {
     return { ready: false, clientId: "", name: "", title: "", location: "", photoUri: "" };
   }
+  const device = loadDeviceCredential();
+  const clientId = device.clientId || createClientId();
   const stored = loadStoredIdentity();
   if (stored) {
-    rememberIdentity({ clientId: stored.clientId, displayName: stored.displayName });
+    rememberIdentity({ clientId, displayName: stored.displayName });
     return {
       ready: true,
-      clientId: stored.clientId,
+      clientId,
       name: stored.displayName,
       title: stored.title ?? "",
       location: stored.location ?? "",
       photoUri: stored.photoUri ?? "",
     };
   }
-  return { ready: true, clientId: createClientId(), name: "", title: "", location: "", photoUri: "" };
+  return { ready: true, clientId, name: "", title: "", location: "", photoUri: "" };
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {
@@ -58,7 +60,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       });
       return;
     }
-    setSession({ ready: true, clientId: createClientId(), name: "", title: "", location: "", photoUri: "" });
+    setSession({ ready: true, clientId: loadDeviceCredential().clientId || createClientId(), name: "", title: "", location: "", photoUri: "" });
   }, [session.ready]);
 
   useEffect(() => {

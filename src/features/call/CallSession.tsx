@@ -3,6 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { Platform, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { canAccessRoom } from "@/domain/membership";
 import { CallAudioSink } from "@/features/call/CallAudioSink";
 import { CallLobby, type CallEntry } from "@/features/call/CallLobby";
 import { IncomingCallNotice } from "@/features/call/IncomingCallNotice";
@@ -221,6 +222,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
       }
       if (!payload.active) {
         forgetCall(payload.roomId);
+        if (roomIdRef.current === payload.roomId) {
+          endCall();
+        }
         return;
       }
       const [call] = readCalls(envelope) ?? [];
@@ -231,14 +235,33 @@ export function CallProvider({ children }: { children: ReactNode }) {
       knownRef.current.add(call.roomId);
       consider(call, isNew);
     });
-  }, [consider, forgetCall]);
+  }, [consider, endCall, forgetCall]);
+
+  useEffect(() => {
+    return getTransport().subscribe("rooms", (envelope) => {
+      if (envelope.type !== "delete") {
+        return;
+      }
+      const roomId = (envelope.payload as { roomId?: string }).roomId;
+      if (!roomId) {
+        return;
+      }
+      forgetCall(roomId);
+      if (roomIdRef.current === roomId) {
+        endCall();
+      }
+    });
+  }, [endCall, forgetCall]);
 
   const startCall = useCallback(
     (nextRoomId: string) => {
-      const id = nextRoomId.trim();
-      if (!id) {
-        return;
-      }
+    const id = nextRoomId.trim();
+    const room = getTransport()
+      .snapshot("rooms")
+      .rooms.find((item) => item.id === id && canAccessRoom(item, clientIdRef.current));
+    if (!id || !room) {
+      return;
+    }
       roomIdRef.current = id;
       setHoldRoomId(null);
       announceRoomCall(id, nameRef.current, clientIdRef.current);

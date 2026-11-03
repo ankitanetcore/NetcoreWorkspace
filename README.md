@@ -17,7 +17,7 @@ cp .env.example .env
 npm run web
 ```
 
-`npm run web` exports the web app and starts the server. With the defaults, open [http://127.0.0.1:8082](http://127.0.0.1:8082).
+`npm run web` exports the web app and starts the server. With the defaults, the server listens on loopback. Open [http://127.0.0.1:8082](http://127.0.0.1:8082). Set `HOST=0.0.0.0` when this machine should accept connections from other computers on the LAN.
 
 The first time a data directory is empty, the server creates it once:
 

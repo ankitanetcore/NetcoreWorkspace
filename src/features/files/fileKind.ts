@@ -9,7 +9,15 @@ export function isImageFile(name: string, mimeType?: string | null) {
 }
 
 export function isPdfFile(name: string, mimeType?: string | null) {
-  return mimeType === "application/pdf" || /\.pdf$/i.test(name);
+  const mime = mimeOf(mimeType);
+  const label = typeof name === "string" ? name : "";
+  if (mime === "application/pdf") {
+    return true;
+  }
+  if (mime && mime !== "application/octet-stream") {
+    return false;
+  }
+  return /\.pdf$/i.test(label);
 }
 
 export function isVideoFile(name: string, mimeType?: string | null) {
@@ -30,8 +38,9 @@ export function isTextFile(name: string, mimeType?: string | null) {
 }
 
 export function fileTypeLabel(name: string, mimeType?: string | null) {
-  const dot = name.lastIndexOf(".");
-  const ext = dot > 0 ? name.slice(dot + 1).trim() : "";
+  const label = typeof name === "string" ? name : "";
+  const dot = label.lastIndexOf(".");
+  const ext = dot > 0 ? label.slice(dot + 1).trim() : "";
   if (ext && ext.length <= 8) {
     return ext.toUpperCase();
   }
@@ -64,6 +73,28 @@ export const previewByteLimit: Record<Exclude<FilePreviewKind, "unsupported">, n
 
 function mimeOf(mimeType?: string | null) {
   return mimeType?.split(";")[0]?.trim().toLowerCase() ?? "";
+}
+
+const previewMimes = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "text/plain",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/mp4",
+  "audio/webm",
+  "audio/ogg",
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+]);
+
+export function previewMime(mimeType?: string | null) {
+  const mime = mimeOf(mimeType);
+  return previewMimes.has(mime) ? mime : "application/octet-stream";
 }
 
 export function isAudioFile(name: string, mimeType?: string | null) {
@@ -105,6 +136,7 @@ export function filePreviewKind(name: string, mimeType?: string | null): FilePre
     ) {
       return "text";
     }
+    return "unsupported";
   }
   if (isImageFile(name, generic ? undefined : mime)) {
     return "image";

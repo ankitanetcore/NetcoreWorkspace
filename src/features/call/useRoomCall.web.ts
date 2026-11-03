@@ -507,11 +507,16 @@ export function useRoomCall(roomId: string | null, onEnded?: () => void): RoomCa
         }
         return;
       }
-      if (envelope.type === "leave") {
+      if (envelope.type === "leave" || envelope.type === "revoke") {
         const remoteId = payload.clientId || payload.from;
-        if (remoteId) {
-          dropLink(remoteId);
+        if (!remoteId) {
+          return;
         }
+        if (remoteId === selfId) {
+          hangUp(true);
+          return;
+        }
+        dropLink(remoteId);
       }
     }
 

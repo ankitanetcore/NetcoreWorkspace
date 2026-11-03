@@ -232,7 +232,8 @@ const roomTones = [
 
 function roomTone(id: string) {
   let hash = 0;
-  for (const char of id) {
+  const key = typeof id === "string" ? id : "";
+  for (const char of key) {
     hash = (hash + char.charCodeAt(0)) % roomTones.length;
   }
   return roomTones[hash];

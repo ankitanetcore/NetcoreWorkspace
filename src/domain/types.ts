@@ -43,6 +43,7 @@ export interface Room {
   messages: RoomMessage[];
   access: RoomAccess;
   memberIds: string[];
+  ownerId?: string;
 }
 
 export interface RoomsSnapshot {
