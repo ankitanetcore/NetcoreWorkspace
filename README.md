@@ -4,6 +4,19 @@ A self-hosted workspace for real-time messaging, file sharing, video calls, and 
 
 One codebase can run as many independent workspaces as you want. Each workspace has its own port and its own data directory. They do not share messages, files, profiles, or settings.
 
+## Screenshots
+
+A fresh desktop workspace. The first person chooses their own name; this one is a demo profile.
+
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="Desktop chat with rooms in the sidebar, a welcome message, and a sent message" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/files.png" alt="Files library listing the Getting Started documents" width="49%">
+  <img src="docs/screenshots/call.png" alt="Video call in a room, waiting for others to join" width="49%">
+</p>
+
 ## Requirements
 
 - Node.js 22.13 or newer
