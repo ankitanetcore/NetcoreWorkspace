@@ -74,6 +74,7 @@ const mediaDir = join(dataDir, "media");
 const sessionsPath = join(dataDir, "sessions.json");
 const sessionCookie = "nw_device";
 const maxFileBytes = 32 * 1024 * 1024;
+const maxUploadBytes = 8 * 1024 * 1024 * 1024;
 const maxChunkCount = 2048;
 const maxChunkLength = 48 * 1024;
 const maxNameLength = 180;
@@ -94,6 +95,7 @@ const inlineMimes = new Set([
   "video/mp4",
   "video/webm",
   "video/ogg",
+  "video/quicktime",
   "text/plain",
 ]);
 const deviceSecrets = new Map();
@@ -691,8 +693,12 @@ function formatByteCount(size) {
   if (size < 1024 * 1024) {
     return `${Math.max(1, Math.round(size / 1024))} KB`;
   }
-  const megabytes = size / (1024 * 1024);
-  return `${megabytes >= 10 ? Math.round(megabytes) : megabytes.toFixed(1)} MB`;
+  if (size < 1024 * 1024 * 1024) {
+    const megabytes = size / (1024 * 1024);
+    return `${megabytes >= 10 ? Math.round(megabytes) : megabytes.toFixed(1)} MB`;
+  }
+  const gigabytes = size / (1024 * 1024 * 1024);
+  return `${gigabytes >= 10 ? Math.round(gigabytes) : gigabytes.toFixed(1)} GB`;
 }
 
 function leftoverWorkspaceData() {
@@ -1102,7 +1108,7 @@ function rememberWorkspace(envelope, actorId = "") {
       body,
       editable: Boolean(file.editable),
       mimeType: storedMime(file.mimeType),
-      size: typeof file.size === "number" && Number.isFinite(file.size) && file.size >= 0 && file.size <= maxFileBytes ? file.size : 0,
+      size: typeof file.size === "number" && Number.isFinite(file.size) && file.size >= 0 && file.size <= maxUploadBytes ? file.size : 0,
       clientId: actor || undefined,
       uploadedAt: new Date().toISOString(),
       modifiedAt: new Date().toISOString(),
@@ -2164,6 +2170,153 @@ async function serveMedia(request, response) {
   }
 }
 
+function uploadMeta(request) {
+  const header = request.headers["x-workspace-upload"];
+  if (typeof header !== "string" || !header) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(decodeURIComponent(header));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function textBodyForUpload(mime, size, filePath) {
+  if (size > maxBodyBytes || !(mime.startsWith("text/") || mime === "application/json" || mime === "application/xml")) {
+    return { body: "This file isn't opened as text.", editable: false };
+  }
+  return { body: readFileSync(filePath, "utf8").slice(0, maxBodyBytes), editable: true };
+}
+
+function acceptUpload(request, response) {
+  const clientId = sessionClientId(request);
+  if (!clientId) {
+    response.writeHead(401, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Unauthorized");
+    return;
+  }
+  const declaredLength = request.headers["content-length"];
+  const declared = declaredLength === undefined ? null : Number(declaredLength);
+  if (declared !== null && (!Number.isSafeInteger(declared) || declared < 0 || declared > maxUploadBytes)) {
+    response.writeHead(413, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("File is too large.");
+    request.resume();
+    return;
+  }
+  const meta = uploadMeta(request);
+  const fileId = boundedId(meta?.fileId);
+  const name = boundedString(meta?.name, maxNameLength);
+  const folderId = typeof meta?.folderId === "string" ? meta.folderId : "";
+  const chat = folderId.length === 0;
+  const folder = chat ? null : findFolder(folderId);
+  const audience = chat ? readAudience(meta, clientId) : null;
+  if (
+    !meta ||
+    !fileId ||
+    safeFileId(fileId) !== fileId ||
+    !name ||
+    fileIdTaken(fileId) ||
+    hasStoredBytes(fileId) ||
+    (chat && !audience) ||
+    (!chat && !folder)
+  ) {
+    response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Bad request.");
+    request.resume();
+    return;
+  }
+  const destination = rawMediaPath(fileId);
+  const partial = `${destination}.partial`;
+  mkdirSync(mediaDir, { recursive: true });
+  rmSync(partial, { force: true });
+  const output = createWriteStream(partial);
+  let settled = false;
+  let received = 0;
+  const fail = (status, message) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    request.unpipe(output);
+    request.destroy();
+    output.destroy();
+    rmSync(partial, { force: true });
+    if (!response.headersSent) {
+      response.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(message);
+    } else {
+      response.destroy();
+    }
+  };
+  request.on("aborted", () => fail(400, "Upload failed."));
+  request.on("error", () => fail(400, "Upload failed."));
+  request.on("data", (chunk) => {
+    received += chunk.length;
+    if (received > maxUploadBytes) {
+      fail(413, "File is too large.");
+    }
+  });
+  output.on("error", (error) => {
+    console.error("Could not store uploaded bytes", error);
+    fail(500, "Could not store that file.");
+  });
+  output.on("finish", () => {
+    if (settled) {
+      return;
+    }
+    if (output.bytesWritten !== received || (declared !== null && output.bytesWritten !== declared)) {
+      fail(400, "Upload failed.");
+      return;
+    }
+    try {
+      renameSync(partial, destination);
+    } catch (error) {
+      console.error("Could not store uploaded bytes", error);
+      fail(500, "Could not store that file.");
+      return;
+    }
+    settled = true;
+    const mimeType = storedMime(meta.mimeType);
+    const text = textBodyForUpload(mimeType, received, destination);
+    const stored = {
+      id: fileId,
+      name,
+      detail: `Uploaded · ${formatByteCount(received)}`,
+      body: text.body,
+      editable: text.editable,
+      mimeType,
+      size: received,
+      clientId,
+      uploadedAt: new Date().toISOString(),
+      modifiedAt: new Date().toISOString(),
+    };
+    if (chat) {
+      workspace.attachments.push({ ...stored, audience, folderId: "" });
+    } else {
+      folder.files.push(stored);
+      sendToAudience(
+        null,
+        JSON.stringify({
+          id: `upload-${fileId}`,
+          topic: "files",
+          type: "create",
+          sentAt: stored.uploadedAt,
+          clientId,
+          payload: { folderId: folder.id, file: stored },
+        }),
+        null,
+        true,
+      );
+    }
+    scheduleSave();
+    response.writeHead(201, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    response.end(JSON.stringify({ file: stored }));
+  });
+  request.pipe(output);
+}
+
 async function acceptSession(request, response) {
   try {
     const body = await readJsonBody(request);
@@ -2205,6 +2358,10 @@ function route(request, response) {
   }
   if (request.method === "POST" && path === "/session") {
     void acceptSession(request, response);
+    return;
+  }
+  if (request.method === "POST" && path === "/upload") {
+    acceptUpload(request, response);
     return;
   }
   if (url.startsWith("/ws")) {

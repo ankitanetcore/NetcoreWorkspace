@@ -2,125 +2,85 @@ import type { DocumentPickerAsset } from "expo-document-picker";
 
 import type { FileAudience, WorkspaceFile } from "@/domain/types";
 import { setFileDownload } from "@/features/files/downloads";
-import { formatBytes, isTextFile, previewMime } from "@/features/files/fileKind";
-import { clearTransferNotice, reportTransferFailure, transferNotice } from "@/features/files/transferNotice";
+import { clearTransferNotice, reportTransferFailure, reportTransferProgress, transferNotice } from "@/features/files/transferNotice";
 import { currentClientId } from "@/session/currentIdentity";
-import { whenSocketDrained } from "@/transport/webSocketTransport";
 import { connectionPhase } from "@/transport/connectionPhase";
-import { getTransport } from "@/transport";
 
-const chunkSize = 16 * 1024;
+const maxUploadBytes = 8 * 1024 * 1024 * 1024;
 
-function modifiedStamp(lastModified?: number) {
-  const date = typeof lastModified === "number" && lastModified > 0 ? new Date(lastModified) : new Date();
-  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
-}
-
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 1) {
-    binary += String.fromCharCode(bytes[index]);
-  }
-  return btoa(binary);
-}
-
-async function readBytes(asset: DocumentPickerAsset) {
-  if (asset.file) {
-    return new Uint8Array(await asset.file.arrayBuffer());
-  }
-  if (!asset.uri) {
-    return null;
-  }
-  const response = await fetch(asset.uri);
-  return new Uint8Array(await response.arrayBuffer());
-}
-
-async function publishTransfer(file: WorkspaceFile, bytes: Uint8Array, folderId: string, audience?: FileAudience) {
-  const transferId = `transfer-${file.id}`;
-  const chunkCount = Math.max(1, Math.ceil(bytes.byteLength / chunkSize));
-  const clientId = currentClientId();
-  const transport = getTransport();
-  if (folderId) {
-    transport.publish({
-      id: file.id,
-      topic: "files",
-      type: "create",
-      sentAt: new Date().toISOString(),
-      clientId: clientId || undefined,
-      payload: { folderId, file, clientId },
-    });
-  }
-  transport.publish({
-    id: `${transferId}-start`,
-    topic: "files",
-    type: "file-start",
-    sentAt: new Date().toISOString(),
-    clientId: clientId || undefined,
-    payload: {
-      transferId,
-      folderId,
-      fileId: file.id,
-      name: file.name,
-      mimeType: file.mimeType,
-      size: file.size,
-      chunkCount,
-      editable: file.editable,
-      body: file.body,
-      detail: file.detail,
-      clientId,
-      audience,
-    },
-  });
-  for (let index = 0; index < chunkCount; index += 1) {
-    const slice = bytes.subarray(index * chunkSize, Math.min(bytes.byteLength, (index + 1) * chunkSize));
-    await whenSocketDrained();
-    transport.publish({
-      id: `${transferId}-${index}`,
-      topic: "files",
-      type: "file-chunk",
-      sentAt: new Date().toISOString(),
-      clientId: clientId || undefined,
-      payload: { transferId, index, data: bytesToBase64(slice), clientId },
-    });
-  }
-  transport.publish({
-    id: `${transferId}-end`,
-    topic: "files",
-    type: "file-end",
-    sentAt: new Date().toISOString(),
-    clientId: clientId || undefined,
-    payload: { transferId, clientId },
+function postFile(file: File, meta: Record<string, unknown>, name: string) {
+  return new Promise<WorkspaceFile>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/upload");
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    xhr.setRequestHeader("x-workspace-upload", encodeURIComponent(JSON.stringify(meta)));
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        reportTransferProgress(name, event.loaded, event.total);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(String(xhr.status)));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(xhr.responseText) as { file?: WorkspaceFile };
+        if (!parsed.file?.id) {
+          reject(new Error("empty"));
+          return;
+        }
+        resolve(parsed.file);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    xhr.onerror = () => reject(new Error("network"));
+    xhr.send(file);
   });
 }
 
-async function prepareUpload(asset: DocumentPickerAsset, name: string) {
+async function uploadFile(asset: DocumentPickerAsset, name: string, folderId: string, audience?: FileAudience) {
   if (connectionPhase() !== "connected") {
     reportTransferFailure(name);
     return null;
   }
-  const bytes = await readBytes(asset);
-  if (!bytes || bytes.byteLength > 32 * 1024 * 1024) {
+  const source = asset.file;
+  if (!source) {
     reportTransferFailure(name);
     return null;
   }
+  if (source.size > maxUploadBytes) {
+    reportTransferFailure(name, `${name} is larger than 8 GB, so it wasn't sent.`);
+    return null;
+  }
   clearTransferNotice();
-  const mimeType = asset.mimeType || "application/octet-stream";
-  const text = isTextFile(name, mimeType);
   const clientId = currentClientId();
-  const file: WorkspaceFile = {
-    id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name,
-    detail: `Uploaded · ${formatBytes(bytes.byteLength)}`,
-    body: text ? new TextDecoder().decode(bytes) : "This file isn't opened as text.",
-    editable: text,
-    mimeType,
-    size: bytes.byteLength,
-    clientId: clientId || undefined,
-    uploadedAt: new Date().toISOString(),
-    modifiedAt: modifiedStamp(asset.lastModified),
-  };
-  setFileDownload(file.id, URL.createObjectURL(new Blob([bytes as BlobPart], { type: previewMime(mimeType) })));
-  return { file, bytes };
+  try {
+    const stored = await postFile(
+      source,
+      {
+        fileId: `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        mimeType: asset.mimeType || source.type || "application/octet-stream",
+        folderId,
+        audience,
+        clientId,
+      },
+      name,
+    );
+    setFileDownload(stored.id, `/media/${encodeURIComponent(stored.id)}`);
+    clearTransferNotice();
+    return stored;
+  } catch (error) {
+    const status = error instanceof Error ? error.message : "";
+    reportTransferFailure(
+      name,
+      status === "413" ? `${name} is larger than 8 GB, so it wasn't sent.` : undefined,
+    );
+    return null;
+  }
 }
 
 export async function transferUploadedFile(
@@ -128,22 +88,14 @@ export async function transferUploadedFile(
   asset: DocumentPickerAsset,
   name: string,
 ): Promise<{ handled: false } | { handled: true; file: WorkspaceFile | null }> {
-  const prepared = await prepareUpload(asset, name);
-  if (!prepared) {
-    return { handled: true, file: null };
-  }
-  await publishTransfer(prepared.file, prepared.bytes, folderId);
-  return { handled: true, file: prepared.file };
+  const stored = await uploadFile(asset, name, folderId);
+  return { handled: true, file: stored };
 }
 
 export async function transferChatFile(asset: DocumentPickerAsset, audience: FileAudience) {
-  const prepared = await prepareUpload(asset, asset.name);
-  if (!prepared) {
+  const stored = await uploadFile(asset, asset.name, "", audience);
+  if (!stored || transferNotice()) {
     return null;
   }
-  await publishTransfer(prepared.file, prepared.bytes, "", audience);
-  if (transferNotice()) {
-    return null;
-  }
-  return prepared.file;
+  return stored;
 }

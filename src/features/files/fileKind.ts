@@ -90,6 +90,7 @@ const previewMimes = new Set([
   "video/mp4",
   "video/webm",
   "video/ogg",
+  "video/quicktime",
 ]);
 
 export function previewMime(mimeType?: string | null) {
@@ -163,5 +164,8 @@ export function formatBytes(size: number) {
   if (size < 1024 * 1024) {
     return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
   }
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  if (size < 1024 * 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }

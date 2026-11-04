@@ -5,9 +5,18 @@ export function transferNotice() {
   return notice;
 }
 
-export function reportTransferFailure(name: string) {
+export function reportTransferProgress(name: string, loaded: number, total: number) {
+  const label = name.trim() || "file";
+  const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+  notice = `Sending ${label}… ${percent}%`;
+  for (const listener of listeners) {
+    listener(notice);
+  }
+}
+
+export function reportTransferFailure(name: string, detail?: string) {
   const label = name.trim();
-  notice = label ? `${label} didn't send. Try again.` : "A file transfer failed. Try again.";
+  notice = detail || (label ? `${label} didn't send. Try again.` : "A file transfer failed. Try again.");
   console.log("File transfer failed", label || "file");
   for (const listener of listeners) {
     listener(notice);

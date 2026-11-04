@@ -122,6 +122,22 @@ function bytesFromBase64(value: string) {
   return bytes;
 }
 
+function rememberUploadedFile(envelope: TransportEnvelope) {
+  if (envelope.topic === "files" && envelope.type === "create") {
+    const file = (envelope.payload as { file?: WorkspaceFile }).file;
+    if (file?.editable) {
+      rememberTextDownload(file, false);
+    } else {
+      rememberStoredFile(file?.id);
+    }
+    return;
+  }
+  if ((envelope.topic === "rooms" || envelope.topic === "direct") && envelope.type === "message") {
+    const fileId = (envelope.payload as { message?: { file?: { fileId?: string } } }).message?.file?.fileId;
+    rememberStoredFile(fileId);
+  }
+}
+
 function rememberTextDownload(file: WorkspaceFile | undefined, replace: boolean) {
   if (!file?.editable || typeof URL === "undefined" || (!replace && fileDownloadUrl(file.id))) {
     return;
@@ -504,9 +520,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
         forgetFileDownload(fileId);
       }
     }
-    if (envelope.topic === "files" && envelope.type === "create") {
-      rememberTextDownload((envelope.payload as { file?: WorkspaceFile }).file, false);
-    }
+    rememberUploadedFile(envelope);
     if (envelope.topic === "files" && envelope.type === "update") {
       const fileId = (envelope.payload as { fileId?: string }).fileId;
       rememberTextDownload(fileId ? findFile(fileId) : undefined, true);
@@ -529,9 +543,7 @@ export function createWebSocketTransport(snapshots: TransportSnapshots): Transpo
         forgetFileDownload(fileId);
       }
     }
-    if (envelope.topic === "files" && envelope.type === "create") {
-      rememberTextDownload((envelope.payload as { file?: WorkspaceFile }).file, false);
-    }
+    rememberUploadedFile(envelope);
     if (envelope.topic === "files" && envelope.type === "update") {
       const fileId = (envelope.payload as { fileId?: string }).fileId;
       rememberTextDownload(fileId ? findFile(fileId) : undefined, true);

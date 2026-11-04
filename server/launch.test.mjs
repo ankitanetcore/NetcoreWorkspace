@@ -150,6 +150,57 @@ test("a workspace admits only its own host, session, and actor", async () => {
     a.socket.close();
     b.socket.close();
 
+    const upload = await request({
+      method: "POST",
+      path: "/upload",
+      headers: {
+        Host: `127.0.0.1:${port}`,
+        Origin: `http://127.0.0.1:${port}`,
+        Cookie: cookieA,
+        "content-type": "application/octet-stream",
+        "x-workspace-upload": encodeURIComponent(JSON.stringify({
+          fileId: "file-launch-upload",
+          name: "clip.mov",
+          mimeType: "video/quicktime",
+          folderId: "getting-started",
+        })),
+      },
+      body: "mov-bytes",
+    });
+    assert.equal(upload.status, 201);
+    const uploaded = JSON.parse(upload.body);
+    assert.equal(uploaded.file.name, "clip.mov");
+    assert.equal(uploaded.file.mimeType, "video/quicktime");
+    assert.equal(uploaded.file.size, "mov-bytes".length);
+    const media = await request({
+      path: "/media/file-launch-upload",
+      headers: {
+        Host: `127.0.0.1:${port}`,
+        Origin: `http://127.0.0.1:${port}`,
+        Cookie: cookieA,
+      },
+    });
+    assert.equal(media.status, 200);
+    assert.equal(media.body, "mov-bytes");
+    assert.match(String(media.headers["content-type"]), /video\/quicktime/);
+    const anonymousUpload = await request({
+      method: "POST",
+      path: "/upload",
+      headers: {
+        Host: `127.0.0.1:${port}`,
+        Origin: `http://127.0.0.1:${port}`,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+        "x-workspace-upload": encodeURIComponent(JSON.stringify({
+          fileId: "file-no-session",
+          name: "nope.mov",
+          folderId: "getting-started",
+        })),
+      },
+      body: "nope",
+    });
+    assert.equal(anonymousUpload.status, 401);
+
     const badPath = await request({ path: "/%", headers: { Host: `127.0.0.1:${port}` } });
     const stillUp = await request({ headers: { Host: `127.0.0.1:${port}` } });
     assert.equal(badPath.status, 400);
