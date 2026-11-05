@@ -88,6 +88,16 @@ export function CheckIcon({ size = 16, color, strokeWidth = 1.75 }: { size?: num
   );
 }
 
+export function TrashIcon({ size = 16, color, strokeWidth = 1.75 }: { size?: number; color: string; strokeWidth?: number }) {
+  return (
+    <StrokeIcon size={size} color={color} strokeWidth={strokeWidth}>
+      {createElement("path", { d: "M3 6h18" })}
+      {createElement("path", { d: "M8 6V4h8v2" })}
+      {createElement("path", { d: "M19 6l-1 14H6L5 6" })}
+    </StrokeIcon>
+  );
+}
+
 export function PencilIcon({ size = 16, color, strokeWidth = 1.75 }: { size?: number; color: string; strokeWidth?: number }) {
   if (Platform.OS !== "web") {
     return (

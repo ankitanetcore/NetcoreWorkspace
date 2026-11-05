@@ -978,7 +978,7 @@ function rememberWorkspace(envelope, actorId = "") {
     room.messages.push(stored);
     return { kind: "message", room, message: stored };
   }
-  if (envelope.topic === "rooms" && (envelope.type === "react" || envelope.type === "edit")) {
+  if (envelope.topic === "rooms" && (envelope.type === "react" || envelope.type === "edit" || envelope.type === "remove")) {
     const room = workspace.rooms.rooms.find((item) => item.id === envelope.payload?.roomId);
     const message = room?.messages.find((item) => item.id === envelope.payload?.messageId);
     if (!room || !canAccessRoom(room, actor) || !message || !actor) {
@@ -1000,6 +1000,24 @@ function rememberWorkspace(envelope, actorId = "") {
           sentAt: new Date().toISOString(),
           clientId: actor,
           payload: { roomId: room.id, messageId: message.id, emoji },
+        },
+      };
+    }
+    if (envelope.type === "remove") {
+      if (message.authorId !== actor) {
+        return { kind: "drop" };
+      }
+      room.messages = room.messages.filter((item) => item.id !== message.id);
+      return {
+        kind: "remove",
+        room,
+        envelope: {
+          id: `rooms-remove-${message.id}-${Date.now()}`,
+          topic: "rooms",
+          type: "remove",
+          sentAt: new Date().toISOString(),
+          clientId: actor,
+          payload: { roomId: room.id, messageId: message.id },
         },
       };
     }
@@ -1537,7 +1555,7 @@ function relayRoomResult(result, raw, socket) {
     }
     return;
   }
-  if (result.kind === "react" || result.kind === "edit") {
+  if (result.kind === "react" || result.kind === "edit" || result.kind === "remove") {
     relayToAccess(result.room, JSON.stringify(result.envelope), socket);
     return;
   }
@@ -1738,7 +1756,7 @@ function cleanDirectMessage(message, actor, other) {
 
 function rememberDirect(envelope, actorId = "") {
   const actor = actorId || "";
-  if (envelope.type === "react" || envelope.type === "edit") {
+  if (envelope.type === "react" || envelope.type === "edit" || envelope.type === "remove") {
     return mutateDirect(envelope, actor);
   }
   if (envelope.type !== "message") {
@@ -1795,6 +1813,24 @@ function mutateDirect(envelope, actor) {
         sentAt: new Date().toISOString(),
         clientId: actor,
         payload: { participantIds: thread.participantIds, messageId: message.id, emoji },
+      },
+    };
+  }
+  if (envelope.type === "remove") {
+    if (message.authorId !== actor) {
+      return { kind: "drop" };
+    }
+    thread.messages = thread.messages.filter((item) => item.id !== message.id);
+    return {
+      kind: "remove",
+      thread,
+      envelope: {
+        id: `direct-remove-${message.id}-${Date.now()}`,
+        topic: "direct",
+        type: "remove",
+        sentAt: new Date().toISOString(),
+        clientId: actor,
+        payload: { participantIds: thread.participantIds, messageId: message.id },
       },
     };
   }

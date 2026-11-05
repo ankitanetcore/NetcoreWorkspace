@@ -1,44 +1,18 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Linking, Platform, Pressable, StyleSheet, Text, TextInput, View, type GestureResponderEvent, type ViewStyle } from "react-native";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Linking, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View, type GestureResponderEvent, type ViewStyle } from "react-native";
 
-import { CheckIcon, MessageSquareIcon, PencilIcon, SmileIcon } from "@/components/ChatIcons";
+import { CheckIcon, MessageSquareIcon, PencilIcon, SmileIcon, TrashIcon } from "@/components/ChatIcons";
 import { CloseIcon } from "@/components/PreviewIcons";
 import type { RoomMessage } from "@/domain/types";
 import { SharedFileCard } from "@/features/files/SharedFileCard";
 import { columnTextStyle } from "@/features/messages/columnText";
+import { applyMark, MessageBody, shortcutMark } from "@/features/messages/markup";
 import { EmojiPicker } from "@/features/messages/EmojiPicker";
 import { quickReactions, reactionList } from "@/features/messages/messageModel";
 import { mountPopup } from "@/features/messages/portal";
 import { useSession } from "@/session/Session";
 import { webPointer } from "@/theme/pressable";
 import { colors, font } from "@/theme/tokens";
-
-const messageUrlPattern = /https?:\/\/[^\s]+/gi;
-
-function linkParts(body: string) {
-  const parts: Array<{ text: string; href?: string }> = [];
-  let last = 0;
-  for (const match of body.matchAll(messageUrlPattern)) {
-    const start = match.index ?? 0;
-    const raw = match[0];
-    if (start > last) {
-      parts.push({ text: body.slice(last, start) });
-    }
-    const href = raw.replace(/[),.;:!?]+$/g, "") || raw;
-    parts.push({ text: href, href });
-    if (href.length < raw.length) {
-      parts.push({ text: raw.slice(href.length) });
-    }
-    last = start + raw.length;
-  }
-  if (last < body.length) {
-    parts.push({ text: body.slice(last) });
-  }
-  if (parts.length === 0) {
-    parts.push({ text: body });
-  }
-  return parts;
-}
 
 function openMessageLink(event: GestureResponderEvent, href: string) {
   event.stopPropagation?.();
@@ -77,6 +51,7 @@ export function ChatMessage({
   linked,
   onReact,
   onEdit,
+  onDelete,
   onReply,
 }: {
   message: RoomMessage;
@@ -87,6 +62,7 @@ export function ChatMessage({
   linked: boolean;
   onReact: (emoji: string) => void;
   onEdit: (body: string) => void;
+  onDelete: () => void;
   onReply: () => void;
 }) {
   const { clientId } = useSession();
@@ -95,16 +71,20 @@ export function ChatMessage({
   const [focused, setFocused] = useState(false);
   const [picker, setPicker] = useState<"quick" | "all" | null>(null);
   const [editing, setEditing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [side, setSide] = useState<"left" | "right">(mine ? "left" : "right");
   const [popupBox, setPopupBox] = useState<{ top: number; left: number; width: number; height: number } | null>(null);
   const [draft, setDraft] = useState(message.body);
   const reactAnchor = useRef<View>(null);
   const popupRef = useRef<View>(null);
   const rootRef = useRef<View>(null);
-  const bodyRef = useRef<Text>(null);
+  const bodyRef = useRef<View>(null);
   const [editSize, setEditSize] = useState<{ width: number; height: number } | null>(null);
   const stackRef = useRef<View>(null);
+  const editRef = useRef<TextInput>(null);
+  const caretRef = useRef<{ start: number; end: number } | null>(null);
   const canEdit = mine && Boolean(message.body.trim());
+  const canDelete = mine && Boolean(message.body.trim() || message.file);
   const shown = hovered || pinned || focused || picker !== null || editing;
   const attachmentOnly = Boolean(message.file) && !message.body?.trim();
   const reactions = reactionList(message.reactions);
@@ -179,7 +159,7 @@ export function ChatMessage({
     }
     const place = () => {
       const rect = stack.getBoundingClientRect();
-      const needed = canEdit ? 112 : 76;
+      const needed = canDelete ? 184 : 76;
       setSide(window.innerWidth - rect.right < needed + 20 ? "left" : "right");
     };
     place();
@@ -190,7 +170,7 @@ export function ChatMessage({
       observer?.disconnect();
       window.removeEventListener("resize", place);
     };
-  }, [canEdit]);
+  }, [canDelete]);
 
   function releaseFocus() {
     if (Platform.OS !== "web" || typeof document === "undefined") {
@@ -249,16 +229,66 @@ export function ChatMessage({
     setEditing(true);
   }
 
+  function askDelete() {
+    setPicker(null);
+    setConfirming(true);
+  }
+
+  function confirmDelete() {
+    setConfirming(false);
+    setEditing(false);
+    onDelete();
+  }
+
   function save() {
     const next = draft.trim();
-    if (!next || next === message.body.trim()) {
+    if (next === message.body.trim()) {
       setEditing(false);
-      setDraft(message.body);
+      return;
+    }
+    if (!next) {
+      askDelete();
       return;
     }
     onEdit(next);
     setEditing(false);
   }
+
+  useEffect(() => {
+    if (!editing || Platform.OS !== "web") {
+      return;
+    }
+    const node = editRef.current as unknown as HTMLTextAreaElement | null;
+    if (!node) {
+      return;
+    }
+    const onKey = (event: KeyboardEvent) => {
+      const mark = shortcutMark(event);
+      if (!mark) {
+        return;
+      }
+      event.preventDefault();
+      const start = node.selectionStart ?? 0;
+      const end = node.selectionEnd ?? start;
+      const next = applyMark(node.value, start, end, mark);
+      caretRef.current = { start: next.start, end: next.end };
+      setDraft(next.value);
+    };
+    node.dataset.format = "markup";
+    node.title = "Ctrl or Cmd + B bold, I italic, U underline, E code.";
+    node.addEventListener("keydown", onKey);
+    return () => node.removeEventListener("keydown", onKey);
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    const pending = caretRef.current;
+    const node = editRef.current as unknown as HTMLTextAreaElement | null;
+    if (!editing || !pending || !node || Platform.OS !== "web") {
+      return;
+    }
+    caretRef.current = null;
+    node.setSelectionRange(pending.start, pending.end);
+  }, [draft, editing]);
 
   const reactionChoices = (
     <View style={[styles.quick, Platform.OS === "web" ? null : [styles.quickFlow, side === "right" ? styles.popupEnd : styles.popupStart]]}>
@@ -379,6 +409,16 @@ export function ChatMessage({
                 <PencilIcon size={16} color={colors.ink} />
               </ToolButton>
             ) : null}
+            {canDelete ? (
+              <ToolButton
+                label={`Delete ${author}'s message`}
+                onPress={askDelete}
+                onFocus={() => setFocused(true)}
+                onBlur={releaseFocus}
+              >
+                <TrashIcon size={16} color={colors.ink} />
+              </ToolButton>
+            ) : null}
           </View>
         </View>
         <Pressable
@@ -389,12 +429,13 @@ export function ChatMessage({
           {editing ? (
             <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubbleOther, styles.editor]}>
               <TextInput
+                ref={editRef}
                 value={draft}
                 onChangeText={setDraft}
-                multiline={draft.includes("\n")}
+                multiline
                 autoFocus
                 accessibilityLabel="Edit message"
-                style={[styles.editorInput, editSize ? { width: editSize.width, height: editSize.height } : null]}
+                style={[styles.editorInput, editSize ? { width: editSize.width, minHeight: editSize.height } : null]}
               />
               <Pressable
                 accessibilityRole="button"
@@ -409,38 +450,23 @@ export function ChatMessage({
               </Pressable>
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel="Save edit"
-                disabled={!draft.trim() || draft.trim() === message.body.trim()}
+                accessibilityLabel={!draft.trim() ? "Delete message" : draft.trim() === message.body.trim() ? "Close edit" : "Save edit"}
                 onPress={save}
-                style={({ pressed, hovered }) => [
-                  styles.editorIcon,
-                  hovered && draft.trim() && draft.trim() !== message.body.trim() && styles.toolOnButton,
-                  webPointer,
-                  pressed && styles.pressed,
-                  (!draft.trim() || draft.trim() === message.body.trim()) && styles.editorOff,
-                ]}
+                style={({ pressed, hovered }) => [styles.editorIcon, hovered && styles.toolOnButton, webPointer, pressed && styles.pressed]}
               >
                 <CheckIcon size={16} color={colors.navy} />
               </Pressable>
             </View>
           ) : message.body?.trim() ? (
             <View style={[styles.bubble, mine ? styles.bubbleMine : styles.bubbleOther]}>
-              <Text ref={bodyRef} style={[styles.body, columnTextStyle(message.body)]}>
-                {linkParts(message.body).map((part, index) =>
-                  part.href ? (
-                    <Text
-                      key={`${index}-${part.href}`}
-                      accessibilityRole="link"
-                      style={styles.link}
-                      onPress={(event) => openMessageLink(event, part.href as string)}
-                    >
-                      {part.text}
-                    </Text>
-                  ) : (
-                    part.text
-                  ),
-                )}
-              </Text>
+              <View ref={bodyRef}>
+                <MessageBody
+                  body={message.body}
+                  onLink={openMessageLink}
+                  baseStyle={{ ...styles.body, ...columnTextStyle(message.body) }}
+                  linkStyle={styles.link}
+                />
+              </View>
             </View>
           ) : null}
         </Pressable>
@@ -479,6 +505,37 @@ export function ChatMessage({
       </View>
     </Pressable>
     {floating}
+    {confirming ? (
+      <Modal visible transparent animationType="fade" onRequestClose={() => setConfirming(false)}>
+        <View style={styles.scrim}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Cancel delete" style={styles.scrimDismiss} onPress={() => setConfirming(false)} />
+          <View style={styles.confirm}>
+            <Text accessibilityRole="header" style={styles.confirmTitle}>
+              Delete this message?
+            </Text>
+            <Text style={styles.confirmBody}>This removes it for everyone in the conversation. You can’t undo it.</Text>
+            <View style={styles.confirmActions}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel"
+                onPress={() => setConfirming(false)}
+                style={({ pressed }) => [styles.confirmCancel, webPointer, pressed && styles.pressed]}
+              >
+                <Text style={styles.confirmCancelLabel}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Delete message"
+                onPress={confirmDelete}
+                style={({ pressed }) => [styles.confirmDelete, webPointer, pressed && styles.pressed]}
+              >
+                <Text style={styles.confirmDeleteLabel}>Delete</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    ) : null}
     </>
   );
 }
@@ -782,5 +839,78 @@ const styles = StyleSheet.create({
   },
   pressed: {
     opacity: 0.72,
+  },
+  scrim: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    backgroundColor: "rgba(20, 32, 51, 0.28)",
+  },
+  scrimDismiss: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  confirm: {
+    width: "100%",
+    maxWidth: 420,
+    gap: 12,
+    padding: 20,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    zIndex: 1,
+  },
+  confirmTitle: {
+    ...font.brand,
+    color: colors.navy,
+    fontSize: 22,
+    lineHeight: 28,
+    fontWeight: "700",
+  },
+  confirmBody: {
+    ...font.content,
+    color: colors.ink,
+    fontSize: 15,
+    lineHeight: 22,
+  },
+  confirmActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 8,
+    marginTop: 4,
+  },
+  confirmCancel: {
+    minHeight: 40,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  confirmCancelLabel: {
+    ...font.ui,
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 18,
+    fontWeight: "600",
+  },
+  confirmDelete: {
+    minHeight: 40,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: colors.burgundy,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  confirmDeleteLabel: {
+    ...font.ui,
+    color: colors.youText,
+    fontSize: 14,
+    lineHeight: 18,
+    fontWeight: "600",
   },
 });

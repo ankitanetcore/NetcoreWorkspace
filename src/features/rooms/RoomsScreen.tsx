@@ -24,7 +24,7 @@ import { FileDropSurface } from "@/features/files/FileDropSurface";
 import { readDirectThreads } from "@/features/direct/direct";
 import { DayDivider } from "@/features/messages/DayDivider";
 import { ChatMessage } from "@/features/messages/ChatMessage";
-import { editInRoom, reactInRoom, replyInRoom } from "@/features/messages/messageActions";
+import { editInRoom, reactInRoom, removeInRoom, replyInRoom } from "@/features/messages/messageActions";
 import { channelMessages, continuesSender, previewText, repliesTo } from "@/features/messages/preview";
 import { sentDay } from "@/features/messages/sentWhen";
 import { ThreadPanel } from "@/features/messages/ThreadPanel";
@@ -572,6 +572,7 @@ function Thread({
                   linked={Boolean(message.parentId)}
                   onReact={(emoji) => reactInRoom(room.id, message.id, emoji)}
                   onEdit={(body) => editInRoom(room.id, message, body)}
+                  onDelete={() => removeInRoom(room.id, message)}
                   onReply={() => setThreadId(message.parentId || message.id)}
                 />
               </View>
@@ -619,6 +620,7 @@ function Thread({
           mineFor={(message) => Boolean(clientId) && message.authorId === clientId}
           onReact={(messageId, emoji) => reactInRoom(room.id, messageId, emoji)}
           onEdit={(message, body) => editInRoom(room.id, message, body)}
+          onDelete={(message) => removeInRoom(room.id, message)}
           onReply={(body, inChannel) => replyInRoom(room.id, threadRoot.id, body, name, inChannel)}
           onClose={() => setThreadId(null)}
         />

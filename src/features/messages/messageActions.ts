@@ -54,6 +54,33 @@ export function editInRoom(roomId: string, message: RoomMessage, body: string) {
   });
 }
 
+export function removeInRoom(roomId: string, message: RoomMessage) {
+  const clientId = currentClientId();
+  if (!clientId || message.authorId !== clientId) {
+    return;
+  }
+  publishRooms("remove", `remove-${message.id}-${Date.now()}`, { roomId, messageId: message.id });
+}
+
+export function removeInDirect(peerId: string, message: RoomMessage) {
+  const clientId = currentClientId();
+  if (!clientId || !peerId || message.authorId !== clientId) {
+    return;
+  }
+  getTransport().publish({
+    id: `remove-${message.id}-${Date.now()}`,
+    topic: "direct",
+    type: "remove",
+    sentAt: stamp(),
+    clientId,
+    payload: {
+      threadId: directThreadId(clientId, peerId),
+      participantIds: [clientId, peerId].sort(),
+      messageId: message.id,
+    },
+  });
+}
+
 export function editInDirect(peerId: string, message: RoomMessage, body: string) {
   const clientId = currentClientId();
   const next = body.trim();

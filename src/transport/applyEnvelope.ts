@@ -177,6 +177,16 @@ export function applyEnvelope(snapshots: TransportSnapshots, envelope: Transport
     return;
   }
 
+  if (envelope.topic === "rooms" && envelope.type === "remove") {
+    const payload = envelope.payload as { roomId?: string; messageId?: string };
+    const room = snapshots.rooms.rooms.find((item) => item.id === payload.roomId);
+    if (!room || !payload.messageId) {
+      return;
+    }
+    room.messages = room.messages.filter((item) => item.id !== payload.messageId);
+    return;
+  }
+
   if (envelope.topic === "rooms" && (envelope.type === "react" || envelope.type === "edit")) {
     const payload = envelope.payload as { roomId?: string; messageId?: string; emoji?: string; body?: string; editedAt?: string };
     const room = snapshots.rooms.rooms.find((item) => item.id === payload.roomId);
@@ -494,6 +504,21 @@ export function applyEnvelope(snapshots: TransportSnapshots, envelope: Transport
       return;
     }
     thread.messages.push(message);
+    return;
+  }
+
+  if (envelope.topic === "direct" && envelope.type === "remove") {
+    const payload = envelope.payload as { participantIds?: unknown; messageId?: string };
+    const participantIds = memberIdsFrom(payload.participantIds).sort();
+    const me = currentClientId();
+    if (participantIds.length !== 2 || !participantIds.includes(me) || !payload.messageId) {
+      return;
+    }
+    const thread = snapshots.direct.threads.find((item) => item.id === directThreadId(participantIds[0], participantIds[1]));
+    if (!thread) {
+      return;
+    }
+    thread.messages = thread.messages.filter((item) => item.id !== payload.messageId);
     return;
   }
 

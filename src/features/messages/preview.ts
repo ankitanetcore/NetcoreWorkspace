@@ -45,7 +45,7 @@ export function repliesTo<T extends { parentId?: string }>(messages: T[], parent
 export function previewText(message: { body?: string; file?: { name?: string } | null }) {
   const body = message.body?.trim() ?? "";
   if (body) {
-    return body;
+    return body.replace(/```/g, "").replace(/\*\*|\+\+|`/g, "");
   }
   if (message.file?.name) {
     return message.file.name;

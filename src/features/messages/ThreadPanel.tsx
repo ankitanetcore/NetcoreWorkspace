@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { ArrowUpIcon } from "@/components/ChatIcons";
 import { CloseIcon } from "@/components/PreviewIcons";
 import type { RoomMessage } from "@/domain/types";
 import { ChatMessage } from "@/features/messages/ChatMessage";
+import { bindResizeGrip, composerCeiling } from "@/features/messages/composerField";
+import { applyMark, shortcutMark } from "@/features/messages/markup";
 import { repliesTo } from "@/features/messages/preview";
 import { webPointer } from "@/theme/pressable";
 import { colors, font, text } from "@/theme/tokens";
@@ -18,6 +20,7 @@ export function ThreadPanel({
   mineFor,
   onReact,
   onEdit,
+  onDelete,
   onReply,
   onClose,
 }: {
@@ -29,6 +32,7 @@ export function ThreadPanel({
   mineFor: (message: RoomMessage) => boolean;
   onReact: (messageId: string, emoji: string) => void;
   onEdit: (message: RoomMessage, body: string) => void;
+  onDelete: (message: RoomMessage) => void;
   onReply: (body: string, inChannel: boolean) => void;
   onClose: () => void;
 }) {
@@ -36,13 +40,128 @@ export function ThreadPanel({
   const replies = repliesTo(messages, parentId);
   const [draft, setDraft] = useState("");
   const [inChannel, setInChannel] = useState(false);
+  const [inputHeight, setInputHeight] = useState<number | null>(null);
+  const [ceiling, setCeiling] = useState(240);
   const listRef = useRef<ScrollView>(null);
+  const panelRef = useRef<View>(null);
+  const composerRef = useRef<View>(null);
+  const gripRef = useRef<View>(null);
   const inputRef = useRef<TextInput>(null);
+  const programmedHeight = useRef(0);
+  const ceilingRef = useRef(ceiling);
+  const caretRef = useRef<{ start: number; end: number } | null>(null);
+  ceilingRef.current = ceiling;
+
+  function fitInput() {
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (!node || Platform.OS !== "web" || node.dataset.manual === "1") {
+      return;
+    }
+    if (programmedHeight.current > 0 && Math.abs(node.offsetHeight - programmedHeight.current) > 4) {
+      node.dataset.manual = "1";
+      const next = Math.max(40, Math.min(ceilingRef.current, node.offsetHeight));
+      programmedHeight.current = next;
+      setInputHeight(next);
+      return;
+    }
+    const previous = node.style.height;
+    node.style.height = "auto";
+    const next = Math.max(40, Math.min(ceilingRef.current, node.scrollHeight));
+    node.style.height = previous;
+    programmedHeight.current = next;
+    setInputHeight(next);
+  }
+
+  useEffect(() => {
+    if (Platform.OS !== "web") {
+      return;
+    }
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (!node) {
+      return;
+    }
+    (panelRef.current as unknown as HTMLElement | null)?.setAttribute("data-thread-panel", "true");
+    (composerRef.current as unknown as HTMLElement | null)?.setAttribute("data-composer-root", "true");
+    node.dataset.format = "markup";
+    node.dataset.resize = "true";
+    node.title = "Drag the bar above to resize. Ctrl or Cmd + B bold, I italic, U underline, E code.";
+    const grip = gripRef.current as unknown as HTMLElement | null;
+    const unbindGrip = grip
+      ? bindResizeGrip(grip, node, {
+          minimum: 40,
+          ceiling: ceilingRef,
+          onHeight: (next) => {
+            node.dataset.manual = "1";
+            programmedHeight.current = next;
+            setInputHeight(next);
+          },
+        })
+      : null;
+    programmedHeight.current = node.offsetHeight;
+    const measure = () => {
+      const cap = composerCeiling(node, 40);
+      ceilingRef.current = cap;
+      setCeiling((current) => (Math.abs(current - cap) <= 1 ? current : cap));
+    };
+    const onPointerUp = () => {
+      if (Math.abs(node.offsetHeight - programmedHeight.current) > 4) {
+        node.dataset.manual = "1";
+        const next = Math.max(40, Math.min(ceilingRef.current, node.offsetHeight));
+        programmedHeight.current = next;
+        setInputHeight(next);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      const mark = shortcutMark(event);
+      if (!mark) {
+        return;
+      }
+      event.preventDefault();
+      const start = node.selectionStart ?? 0;
+      const end = node.selectionEnd ?? start;
+      const next = applyMark(node.value, start, end, mark);
+      caretRef.current = { start: next.start, end: next.end };
+      setDraft(next.value);
+      requestAnimationFrame(() => fitInput());
+    };
+    measure();
+    const pane = panelRef.current as unknown as HTMLElement | null;
+    const observer = pane && typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    if (pane) {
+      observer?.observe(pane);
+    }
+    node.addEventListener("keydown", onKey);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      unbindGrip?.();
+      node.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = caretRef.current;
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (!pending || !node || Platform.OS !== "web") {
+      return;
+    }
+    caretRef.current = null;
+    node.setSelectionRange(pending.start, pending.end);
+  }, [draft]);
   const label = audience === "room" ? "Also send to channel" : "Also send to conversation";
 
   useEffect(() => {
     setDraft("");
     setInChannel(false);
+    setInputHeight(null);
+    programmedHeight.current = 0;
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (node) {
+      delete node.dataset.manual;
+    }
   }, [parentId]);
 
   useEffect(() => {
@@ -56,6 +175,12 @@ export function ThreadPanel({
     }
     onReply(body, inChannel);
     setDraft("");
+    setInputHeight(null);
+    programmedHeight.current = 0;
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (node) {
+      delete node.dataset.manual;
+    }
     setInChannel(false);
   }
 
@@ -64,7 +189,7 @@ export function ThreadPanel({
   }
 
   return (
-    <View style={[styles.panel, overlay && styles.overlay]}>
+    <View ref={panelRef} style={[styles.panel, overlay && styles.overlay]}>
       <View style={styles.header}>
         <Text accessibilityRole="header" style={[text.title, styles.heading]}>
           Thread
@@ -88,6 +213,7 @@ export function ThreadPanel({
           linked={false}
           onReact={(emoji) => onReact(parent.id, emoji)}
           onEdit={(body) => onEdit(parent, body)}
+          onDelete={() => onDelete(parent)}
           onReply={() => inputRef.current?.focus()}
         />
         {replies.length > 0 ? <Text style={styles.section}>{replies.length === 1 ? "1 reply" : `${replies.length} replies`}</Text> : null}
@@ -102,11 +228,12 @@ export function ThreadPanel({
             linked={false}
             onReact={(emoji) => onReact(message.id, emoji)}
             onEdit={(body) => onEdit(message, body)}
+            onDelete={() => onDelete(message)}
             onReply={() => inputRef.current?.focus()}
           />
         ))}
       </ScrollView>
-      <View style={styles.composer}>
+      <View ref={composerRef} style={styles.composer}>
         <Pressable
           accessibilityRole="checkbox"
           accessibilityState={{ checked: inChannel }}
@@ -119,11 +246,29 @@ export function ThreadPanel({
           </View>
           <Text style={styles.checkLabel}>{label}</Text>
         </Pressable>
+        <View
+          ref={gripRef}
+          accessibilityRole="adjustable"
+          accessibilityLabel="Drag to resize the reply box"
+          style={[styles.grip, Platform.OS === "web" ? ({ cursor: "ns-resize" } as object) : null]}
+        >
+          <View style={styles.gripBar} />
+        </View>
         <View style={styles.field}>
           <TextInput
             ref={inputRef}
             value={draft}
-            onChangeText={setDraft}
+            onChangeText={(value) => {
+              setDraft(value);
+              const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+              if (!value && node) {
+                delete node.dataset.manual;
+                programmedHeight.current = 0;
+                setInputHeight(null);
+                return;
+              }
+              requestAnimationFrame(() => fitInput());
+            }}
             placeholder="Reply in thread"
             placeholderTextColor={colors.faint}
             accessibilityLabel="Reply in thread"
@@ -134,7 +279,12 @@ export function ThreadPanel({
                 send();
               }
             }}
-            style={[styles.input, Platform.OS === "web" ? { outlineWidth: 0 } : null]}
+            style={[
+              styles.input,
+              { maxHeight: ceiling },
+              inputHeight ? { height: inputHeight } : null,
+              Platform.OS === "web" ? ({ resize: "vertical", overflowY: "auto", outlineWidth: 0 } as object) : null,
+            ]}
           />
           <Pressable
             accessibilityRole="button"
@@ -253,6 +403,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
   },
+  grip: {
+    alignSelf: "stretch",
+    alignItems: "center",
+    justifyContent: "center",
+    height: 16,
+  },
+  gripBar: {
+    width: 48,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: colors.muted,
+  },
   field: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -262,7 +424,6 @@ const styles = StyleSheet.create({
     ...font.content,
     flex: 1,
     minHeight: 40,
-    maxHeight: 120,
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: 12,

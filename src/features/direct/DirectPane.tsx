@@ -1,5 +1,5 @@
 import * as DocumentPicker from "expo-document-picker";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 
 import { BackButton } from "@/components/BackButton";
@@ -14,7 +14,9 @@ import { subscribeTransferNotice } from "@/features/files/transferNotice";
 import { EmojiPicker } from "@/features/messages/EmojiPicker";
 import { DayDivider } from "@/features/messages/DayDivider";
 import { ChatMessage } from "@/features/messages/ChatMessage";
-import { editInDirect, reactInDirect, replyInDirect } from "@/features/messages/messageActions";
+import { editInDirect, reactInDirect, removeInDirect, replyInDirect } from "@/features/messages/messageActions";
+import { bindResizeGrip, composerCeiling } from "@/features/messages/composerField";
+import { applyMark, shortcutMark } from "@/features/messages/markup";
 import { channelMessages, continuesSender, repliesTo } from "@/features/messages/preview";
 import { sentDay } from "@/features/messages/sentWhen";
 import { ThreadPanel } from "@/features/messages/ThreadPanel";
@@ -136,6 +138,7 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
                   linked={Boolean(message.parentId)}
                   onReact={(emoji) => reactInDirect(peerId, message.id, emoji)}
                   onEdit={(body) => editInDirect(peerId, message, body)}
+                  onDelete={() => removeInDirect(peerId, message)}
                   onReply={() => setThreadId(message.parentId || message.id)}
                 />
               </View>
@@ -165,6 +168,7 @@ export function DirectPane({ peerId, onBack }: { peerId: string; onBack?: () => 
           mineFor={(message) => message.authorId === clientId}
           onReact={(messageId, emoji) => reactInDirect(peerId, messageId, emoji)}
           onEdit={(message, body) => editInDirect(peerId, message, body)}
+          onDelete={(message) => removeInDirect(peerId, message)}
           onReply={(body, inChannel) => replyInDirect(peerId, threadRoot.id, body, name, inChannel)}
           onClose={() => setThreadId(null)}
         />
@@ -188,7 +192,6 @@ function outgoingId(kind: "file" | "text") {
 const inputLineHeight = 22;
 const inputPad = 9;
 const singleLineHeight = inputLineHeight + inputPad * 2;
-const maxInputHeight = inputLineHeight * 5 + inputPad * 2;
 
 function useComposerFrame(fieldRef: { current: View | null }) {
   useEffect(() => {
@@ -197,11 +200,13 @@ function useComposerFrame(fieldRef: { current: View | null }) {
     }
     const node = fieldRef.current as unknown as HTMLElement | null;
     node?.setAttribute("data-composer", "field");
-    if (document.getElementById("netcore-composer")) {
-      return;
+    node?.parentElement?.parentElement?.parentElement?.setAttribute("data-composer-root", "true");
+    let style = document.getElementById("netcore-composer");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "netcore-composer";
+      document.head.appendChild(style);
     }
-    const style = document.createElement("style");
-    style.id = "netcore-composer";
     style.textContent = `
       [data-composer="field"]:focus-within {
         border-color: rgba(122, 48, 64, 0.4);
@@ -211,7 +216,19 @@ function useComposerFrame(fieldRef: { current: View | null }) {
         border: none;
         box-shadow: none;
         background: transparent;
-        resize: none;
+        resize: vertical !important;
+        overflow-y: auto !important;
+      }
+      textarea[data-resize="true"] {
+        resize: vertical !important;
+        overflow-y: auto !important;
+      }
+      [data-composer-grip="true"] {
+        cursor: ns-resize;
+        touch-action: none;
+      }
+      [data-composer-grip="true"]:hover [data-grip-bar="true"] {
+        background: #142033;
       }
       [data-composer="field"] textarea:focus,
       [data-composer="field"] textarea:focus-visible {
@@ -220,7 +237,6 @@ function useComposerFrame(fieldRef: { current: View | null }) {
         box-shadow: none;
       }
     `;
-    document.head.appendChild(style);
   }, []);
 }
 
@@ -244,10 +260,16 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState("");
   const [inputHeight, setInputHeight] = useState(singleLineHeight);
+  const [ceiling, setCeiling] = useState(singleLineHeight * 8);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const fieldRef = useRef<View>(null);
+  const gripRef = useRef<View>(null);
   const emojiButtonRef = useRef<View>(null);
   const inputRef = useRef<TextInput>(null);
+  const programmedHeight = useRef(singleLineHeight);
+  const ceilingRef = useRef(ceiling);
+  const caretRef = useRef<{ start: number; end: number } | null>(null);
+  ceilingRef.current = ceiling;
   useComposerFrame(fieldRef);
 
   function insertEmoji(emoji: string) {
@@ -256,25 +278,35 @@ export function Composer({
     const end = typeof node?.selectionEnd === "number" ? node.selectionEnd : draft.length;
     const next = `${draft.slice(0, start)}${emoji}${draft.slice(end)}`;
     const cursor = start + emoji.length;
+    caretRef.current = { start: cursor, end: cursor };
     setDraft(next);
-    requestAnimationFrame(() => {
-      node?.focus();
-      node?.setSelectionRange(cursor, cursor);
-      resizeInput();
-    });
+    requestAnimationFrame(() => resizeInput());
   }
 
   function resizeInput(contentHeight?: number) {
+    const cap = ceilingRef.current;
     const node = inputRef.current as unknown as HTMLTextAreaElement | null;
     if (!node || Platform.OS !== "web") {
       if (typeof contentHeight === "number") {
-        const next = Math.max(singleLineHeight, Math.min(maxInputHeight, contentHeight));
+        const next = Math.max(singleLineHeight, Math.min(cap, contentHeight));
         setInputHeight((current) => (current === next ? current : next));
       }
       return;
     }
-    node.style.height = `${singleLineHeight}px`;
-    const next = Math.max(singleLineHeight, Math.min(maxInputHeight, node.scrollHeight));
+    if (node.dataset.manual === "1" || Math.abs(node.offsetHeight - programmedHeight.current) > 4) {
+      if (node.dataset.manual !== "1") {
+        node.dataset.manual = "1";
+        const next = Math.max(singleLineHeight, Math.min(cap, node.offsetHeight));
+        programmedHeight.current = next;
+        setInputHeight(next);
+      }
+      return;
+    }
+    const previous = node.style.height;
+    node.style.height = "auto";
+    const next = Math.max(singleLineHeight, Math.min(cap, node.scrollHeight));
+    node.style.height = previous;
+    programmedHeight.current = next;
     setInputHeight((current) => (current === next ? current : next));
   }
   const onDroppedRef = useRef(onDropped);
@@ -333,9 +365,76 @@ export function Composer({
       });
       setNotice(images.length > 1 ? "Attached the first image. Send it, then paste the next." : "");
     };
+    const onKey = (event: KeyboardEvent) => {
+      const mark = shortcutMark(event);
+      if (!mark) {
+        return;
+      }
+      event.preventDefault();
+      const start = node.selectionStart ?? 0;
+      const end = node.selectionEnd ?? start;
+      const next = applyMark(node.value, start, end, mark);
+      caretRef.current = { start: next.start, end: next.end };
+      setDraft(next.value);
+      requestAnimationFrame(() => resizeInput());
+    };
+    const keepDraggedHeight = () => {
+      if (Math.abs(node.offsetHeight - programmedHeight.current) > 4) {
+        node.dataset.manual = "1";
+        const next = Math.max(singleLineHeight, Math.min(ceilingRef.current, node.offsetHeight));
+        programmedHeight.current = next;
+        setInputHeight(next);
+      }
+    };
+    const measure = () => {
+      const cap = composerCeiling(node, singleLineHeight);
+      ceilingRef.current = cap;
+      setCeiling((current) => (Math.abs(current - cap) <= 1 ? current : cap));
+    };
+    node.dataset.format = "markup";
+    node.dataset.resize = "true";
+    node.title = "Drag the bar above to resize. Ctrl or Cmd + B bold, I italic, U underline, E code.";
+    const grip = gripRef.current as unknown as HTMLElement | null;
+    const unbindGrip = grip
+      ? bindResizeGrip(grip, node, {
+          minimum: singleLineHeight,
+          ceiling: ceilingRef,
+          onHeight: (next) => {
+            node.dataset.manual = "1";
+            programmedHeight.current = next;
+            setInputHeight(next);
+          },
+        })
+      : null;
+    measure();
+    const pane = node.closest("[data-file-drop='true']");
+    const observer = pane && typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    if (pane) {
+      observer?.observe(pane);
+    }
     node.addEventListener("paste", onPaste);
-    return () => node.removeEventListener("paste", onPaste);
+    node.addEventListener("keydown", onKey);
+    window.addEventListener("pointerup", keepDraggedHeight);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      unbindGrip?.();
+      node.removeEventListener("paste", onPaste);
+      node.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerup", keepDraggedHeight);
+      window.removeEventListener("resize", measure);
+    };
   }, []);
+
+  useLayoutEffect(() => {
+    const pending = caretRef.current;
+    const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+    if (!pending || !node || Platform.OS !== "web") {
+      return;
+    }
+    caretRef.current = null;
+    node.setSelectionRange(pending.start, pending.end);
+  }, [draft]);
 
   const body = draft.trim();
   const ready = Boolean(body || pending) && !sending;
@@ -406,6 +505,11 @@ export function Composer({
         }
         setDraft("");
         setInputHeight(singleLineHeight);
+        programmedHeight.current = singleLineHeight;
+        const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+        if (node) {
+          delete node.dataset.manual;
+        }
         setEmojiOpen(false);
       }
       clearAttempt();
@@ -440,6 +544,14 @@ export function Composer({
         </View>
       ) : null}
       {notice ? <Text style={styles.notice}>{notice}</Text> : null}
+      <View
+        ref={gripRef}
+        accessibilityRole="adjustable"
+        accessibilityLabel="Drag to resize the message box"
+        style={[styles.grip, Platform.OS === "web" ? ({ cursor: "ns-resize" } as object) : null]}
+      >
+        <View style={styles.gripBar} />
+      </View>
       <View style={styles.fieldAnchor}>
       {emojiOpen ? (
         <EmojiPicker
@@ -466,7 +578,10 @@ export function Composer({
             value={draft}
             onChangeText={(value) => {
               setDraft(value);
-              if (!value) {
+              const node = inputRef.current as unknown as HTMLTextAreaElement | null;
+              if (!value && node) {
+                delete node.dataset.manual;
+                programmedHeight.current = singleLineHeight;
                 setInputHeight(singleLineHeight);
               }
               requestAnimationFrame(resizeInput);
@@ -485,7 +600,11 @@ export function Composer({
                 void send();
               }
             }}
-            style={[styles.input, { height: inputHeight }]}
+            style={[
+              styles.input,
+              { height: inputHeight, maxHeight: ceiling },
+              Platform.OS === "web" ? ({ resize: "vertical", overflowY: "auto" } as object) : null,
+            ]}
           />
           <View ref={emojiButtonRef} collapsable={false}>
             <Pressable
@@ -688,6 +807,19 @@ const styles = StyleSheet.create({
     position: "relative",
     zIndex: 2,
   },
+  grip: {
+    alignSelf: "stretch",
+    alignItems: "center",
+    justifyContent: "center",
+    height: 18,
+    marginBottom: 2,
+  },
+  gripBar: {
+    width: 48,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: colors.muted,
+  },
   composerRow: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -703,9 +835,8 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
     minHeight: singleLineHeight,
-    maxHeight: maxInputHeight,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: 12,
@@ -723,7 +854,6 @@ const styles = StyleSheet.create({
     ...font.content,
     flex: 1,
     minWidth: 0,
-    maxHeight: maxInputHeight,
     marginVertical: 0,
     paddingTop: inputPad,
     paddingBottom: inputPad,
