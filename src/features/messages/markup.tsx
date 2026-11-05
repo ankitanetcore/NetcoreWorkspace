@@ -216,7 +216,7 @@ function renderPieces(
     if (piece.kind === "block") {
       return (
         <Text key={`block-${index}`} style={blockStyle}>
-          {`\n${piece.text}\n`}
+          {piece.text}
         </Text>
       );
     }
